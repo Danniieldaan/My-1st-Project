@@ -122,10 +122,45 @@ const SL=Object.fromEntries(STAGES.map(s=>[s.key,s.label]));
 const FRAME_STAGES={'Stretched Canvas':['WoodCut','WoodJoin','Stretch'],'Floating Frame':['WoodCut','WoodJoin','FrameCut','FrameJoin','Assembly'],'Glass Frame':['WoodCut','WoodJoin','Stretch','FrameCut','FrameJoin','GlassCut','Assembly']};
 const FTYPES=['Stretched Canvas','Floating Frame','Glass Frame'];
 const PMETHODS=['Bank Transfer','Cash','Cheque','POS','USSD'];
-const PRICE={Frame:{Small:15000,Medium:28000,Large:55000}};
+const SQMATRIX=[
+  {w:30,h:30,a:900,c:6000,f:12000,g:15000},
+  {w:60,h:60,a:3600,c:12000,f:25000,g:30000},
+  {w:80,h:80,a:6400,c:16000,f:30000,g:40000},
+  {w:100,h:100,a:10000,c:20000,f:35000,g:45000}];
+const RECTMATRIX=[
+  {w:30,h:40,a:1200,c:7000,f:14000,g:18000},
+  {w:40,h:60,a:2400,c:10000,f:18000,g:23000},
+  {w:40,h:80,a:3200,c:11000,f:20000,g:25000},
+  {w:50,h:100,a:5000,c:15000,f:25000,g:30000},
+  {w:60,h:90,a:5400,c:15000,f:25000,g:30000},
+  {w:60,h:120,a:7200,c:17000,f:30000,g:40000},
+  {w:70,h:140,a:9800,c:20000,f:35000,g:45000},
+  {w:80,h:120,a:9600,c:20000,f:35000,g:45000},
+  {w:80,h:160,a:12800,c:27000,f:40000,g:65000},
+  {w:90,h:180,a:16200,c:31000,f:50000,g:80000},
+  {w:100,h:150,a:15000,c:28000,f:45000,g:65000},
+  {w:100,h:200,a:20000,c:35000,f:60000,g:85000},
+  {w:120,h:180,a:21600,c:35000,f:50000,g:80000}];
 const CM={Small:{WoodCut:100,WoodJoin:100,Stretch:100,FrameCut:100,FrameJoin:100,GlassCut:100,Assembly:100},Medium:{WoodCut:125,WoodJoin:125,Stretch:150,FrameCut:125,FrameJoin:125,GlassCut:125,Assembly:100},Large:{WoodCut:150,WoodJoin:150,Stretch:200,FrameCut:150,FrameJoin:150,GlassCut:150,Assembly:100}};
 function sTier(w,h){const W=w||0,H=h||0;if(W<60&&H<90)return'Small';if(W>=60&&W<=70&&H>=90&&H<=140)return'Medium';if(W>=80&&H>=160)return'Large';const A=W*H;return A<=5400?'Small':A<=9800?'Medium':'Large';}
-function iPrice(it){return((PRICE.Frame||{})[sTier(it.width,it.height)]||0)*(it.qty||1);}
+function calcPrice(w,h,ft){
+  w=parseFloat(w)||0;h=parseFloat(h)||0;
+  if(w<=0||h<=0)return 0;
+  if(w>h){const t=w;w=h;h=t;}
+  const area=w*h,matrix=w===h?SQMATRIX:RECTMATRIX;
+  let low=matrix[0],high=matrix[matrix.length-1];
+  for(let i=0;i<matrix.length;i++){
+    if(matrix[i].a<=area)low=matrix[i];
+    if(matrix[i].a>area){high=matrix[i];break;}}
+  const f=low.a===high.a?0:(area-low.a)/(high.a-low.a);
+  const cc=Math.round(low.c+f*(high.c-low.c));
+  const cf=Math.round(low.f+f*(high.f-low.f));
+  const cg=Math.round(low.g+f*(high.g-low.g));
+  const ftl=(ft||'').toLowerCase().trim();
+  if(ftl==='stretched canvas')return cc;
+  if(ftl==='canvas and frame')return cf;
+  return cg;}
+function iPrice(it){if(!it||!it.width||!it.height)return 0;return calcPrice(it.width,it.height,it.ft)*(it.qty||1);}
 function gComm(tier,sk){return(CM[tier]||CM.Small)[sk]||0;}
 function spComm(tr){const job=DB.items.find(j=>j.id===tr.jid);if(!job)return{each:0,tier:'Small',total:0,names:[]};const tier=sTier(job.width,job.height);const total=gComm(tier,tr.sk);const names=tr.artisans?tr.artisans.split(',').map(s=>s.trim()).filter(Boolean):[];return{each:names.length?Math.floor(total/names.length):total,tier,total,names};}
 function effDate(tr){return tr.dateOverride||tr.date;}
