@@ -1,0 +1,2510 @@
+================================================
+FILE: package.json
+================================================
+{
+  "name": "framing-erp",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "server": "node server/src/index.js",
+    "client": "cd client && npx vite --host",
+    "dev": "concurrently \"npm run server\" \"npm run client\"",
+    "setup": "cd server && npm install && cd ../client && npm install"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2"
+  }
+}
+
+================================================
+FILE: server/package.json
+================================================
+{
+  "name": "framing-erp-server",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.21.0",
+    "sql.js": "^1.10.0"
+  }
+}
+
+================================================
+FILE: client/package.json
+================================================
+{
+  "name": "framing-erp-client",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-router-dom": "^6.26.0",
+    "recharts": "^2.12.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.3.1",
+    "vite": "^5.4.0"
+  }
+}
+
+================================================
+FILE: start.bat
+================================================
+@echo off
+cd /d "%~dp0"
+echo Starting Framing ERP System...
+echo.
+
+start "ERP Server" cmd /c "cd /d server && node src/index.js"
+echo Backend starting on http://localhost:3001 ...
+timeout /t 3 /nobreak >nul
+
+start "ERP Client" cmd /c "cd /d client && npx vite --host --port 5173"
+echo Frontend starting on http://localhost:5173 ...
+echo.
+echo Open http://localhost:5173 in your browser
+echo Close both windows to stop the system.
+pause
+
+================================================
+FILE: server/src/index.js
+================================================
+const express = require('express');
+const cors = require('cors');
+const { initDatabase } = require('./database');
+
+async function main() {
+  const app = express();
+  const PORT = process.env.PORT || 3001;
+
+  app.use(cors());
+  app.use(express.json());
+
+  const { wrapper, save } = await initDatabase();
+  app.set('db', wrapper);
+  app.set('dbSave', save);
+  setInterval(() => save(), 10000);
+
+  app.use('/api/customers', require('./routes/customers'));
+  app.use('/api/quotes', require('./routes/quotes'));
+  app.use('/api/quote-items', require('./routes/quoteItems'));
+  app.use('/api/production-logs', require('./routes/productionLogs'));
+  app.use('/api/receipts', require('./routes/receipts'));
+  app.use('/api/settings', require('./routes/settings'));
+  app.use('/api/dashboard', require('./routes/dashboard'));
+  app.use('/api/payroll', require('./routes/payroll'));
+  app.use('/api/reports', require('./routes/reports'));
+
+  app.listen(PORT, () => {
+    console.log(`ERP Server running on http://localhost:${PORT}`);
+  });
+}
+
+main().catch(console.error);
+
+================================================
+FILE: server/src/database.js
+================================================
+const initSqlJs = require('sql.js');
+const path = require('path');
+const fs = require('fs');
+
+const DB_PATH = path.join(__dirname, '..', 'data', 'framing_erp.db');
+
+function createWrapper(db) {
+  return {
+    prepare(sql) {
+      let stmt = null;
+      return {
+        get(...params) {
+          try { stmt?.free(); } catch {}
+          stmt = db.prepare(sql);
+          if (params.length > 0) stmt.bind(params);
+          if (stmt.step()) return stmt.getAsObject();
+          return undefined;
+        },
+        all(...params) {
+          try { stmt?.free(); } catch {}
+          stmt = db.prepare(sql);
+          if (params.length > 0) stmt.bind(params);
+          const rows = [];
+          while (stmt.step()) rows.push(stmt.getAsObject());
+          return rows;
+        },
+        run(...params) {
+          try { stmt?.free(); } catch {}
+          stmt = db.prepare(sql);
+          if (params.length > 0) stmt.bind(params);
+          stmt.step();
+          const lastId = db.exec("SELECT last_insert_rowid() as id");
+          const id = lastId.length > 0 ? lastId[0].values[0][0] : 0;
+          return { lastInsertRowid: id, changes: db.getRowsModified() };
+        }
+      };
+    },
+    run(sql, params = []) {
+      db.run(sql, params);
+      return { lastInsertRowid: 0, changes: db.getRowsModified() };
+    },
+    exec(sql) { return db.exec(sql); }
+  };
+}
+
+async function initDatabase() {
+  const dir = path.dirname(DB_PATH);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+
+  const SQL = await initSqlJs();
+  let db;
+  if (fs.existsSync(DB_PATH)) {
+    const buffer = fs.readFileSync(DB_PATH);
+    db = new SQL.Database(buffer);
+  } else {
+    db = new SQL.Database();
+  }
+
+  db.run(`
+    CREATE TABLE IF NOT EXISTS customers (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL,
+      phone TEXT DEFAULT '',
+      email TEXT DEFAULT '',
+      address TEXT DEFAULT '',
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE TABLE IF NOT EXISTS quotes (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      customer_id INTEGER NOT NULL,
+      date_created DATE DEFAULT (date('now')),
+      discount REAL DEFAULT 0,
+      total_amount REAL DEFAULT 0,
+      grand_total REAL DEFAULT 0,
+      deposit_paid REAL DEFAULT 0,
+      balance_due REAL DEFAULT 0,
+      status TEXT DEFAULT 'Draft' CHECK(status IN ('Draft','Sent','Deposit Paid','Send to Production')),
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (customer_id) REFERENCES customers(id)
+    );
+    CREATE TABLE IF NOT EXISTS quote_items (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      quote_id INTEGER NOT NULL,
+      product_type TEXT NOT NULL CHECK(product_type IN ('Base Print','Stretch Canvas','Floating Frame','Glass Frame','Hardwood Floor')),
+      quantity INTEGER DEFAULT 1,
+      measurement_unit TEXT DEFAULT 'cm' CHECK(measurement_unit IN ('cm','inches')),
+      width REAL,
+      height REAL,
+      square_meters REAL,
+      size_tier TEXT,
+      calculated_price REAL DEFAULT 0,
+      production_status TEXT DEFAULT 'Pending' CHECK(production_status IN ('Pending','In Production','Complete')),
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (quote_id) REFERENCES quotes(id) ON DELETE CASCADE
+    );
+    CREATE TABLE IF NOT EXISTS production_logs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      job_id INTEGER NOT NULL,
+      stage_completed TEXT NOT NULL CHECK(stage_completed IN ('Wood Cut','Wood Join','Stretch','Frame Cut','Frame Join','Glass Cut','Assembly')),
+      artisans TEXT NOT NULL DEFAULT '[]',
+      worker_count INTEGER DEFAULT 1,
+      total_stage_commission REAL DEFAULT 0,
+      split_commission REAL DEFAULT 0,
+      date_completed DATE NOT NULL,
+      payment_status TEXT DEFAULT 'Unpaid' CHECK(payment_status IN ('Unpaid','Paid')),
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (job_id) REFERENCES quote_items(id) ON DELETE CASCADE
+    );
+    CREATE TABLE IF NOT EXISTS receipts (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      quote_id INTEGER NOT NULL,
+      payment_date DATE NOT NULL,
+      amount_paid REAL NOT NULL,
+      payment_method TEXT NOT NULL CHECK(payment_method IN ('Cash','Transfer','POS')),
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (quote_id) REFERENCES quotes(id) ON DELETE CASCADE
+    );
+    CREATE TABLE IF NOT EXISTS settings (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      key TEXT UNIQUE NOT NULL,
+      value TEXT NOT NULL
+    );
+  `);
+
+  const wrapper = createWrapper(db);
+
+  const count = wrapper.prepare('SELECT COUNT(*) as c FROM settings').get();
+  if (count.c === 0) {
+    const defaults = [
+      ['pricing_base_rates', JSON.stringify({ 'Small': 6, 'Medium': 3.5, 'Large': 2.2, 'Extra Large': 1.8 })],
+      ['pricing_framing_multipliers', JSON.stringify({ 'Small': 2.0, 'Medium': 1.6, 'Large': 1.5, 'Extra Large': 1.4 })],
+      ['pricing_glass_multipliers', JSON.stringify({ 'Small': 1.3, 'Medium': 1.4, 'Large': 1.5, 'Extra Large': 1.6 })],
+      ['pricing_floor_rate', '15000'],
+      ['commission_matrix', JSON.stringify({
+        'Wood Cut': { 'Small': 100, 'Medium': 125, 'Large': 150 },
+        'Wood Join': { 'Small': 100, 'Medium': 125, 'Large': 150 },
+        'Stretch': { 'Small': 100, 'Medium': 150, 'Large': 200 },
+        'Frame Cut': { 'Small': 100, 'Medium': 125, 'Large': 150 },
+        'Frame Join': { 'Small': 100, 'Medium': 125, 'Large': 150 },
+        'Glass Cut': { 'Small': 100, 'Medium': 125, 'Large': 150 },
+        'Assembly': { 'Small': 100, 'Medium': 100, 'Large': 100 }
+      })],
+      ['production_routing', JSON.stringify({
+        'Base Print': [],
+        'Stretch Canvas': ['Wood Cut', 'Wood Join', 'Stretch'],
+        'Floating Frame': ['Wood Cut', 'Wood Join', 'Stretch', 'Frame Cut', 'Frame Join', 'Assembly'],
+        'Glass Frame': ['Wood Cut', 'Wood Join', 'Stretch', 'Frame Cut', 'Frame Join', 'Glass Cut', 'Assembly'],
+        'Hardwood Floor': []
+      })]
+    ];
+    for (const [key, value] of defaults) {
+      db.run('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)', [key, value]);
+    }
+  }
+
+  saveDb(db);
+  return { db, wrapper, save: () => saveDb(db) };
+}
+
+function saveDb(db) {
+  const data = db.export();
+  const buffer = Buffer.from(data);
+  fs.writeFileSync(DB_PATH, buffer);
+}
+
+module.exports = { initDatabase, DB_PATH };
+
+================================================
+FILE: server/src/pricing.js
+================================================
+function getSizeTier(width, height, unit) {
+  const w = unit === 'inches' ? width * 2.54 : width;
+  const h = unit === 'inches' ? height * 2.54 : height;
+  if (w < 60 && h < 90) return 'Small';
+  if (w >= 80 || h >= 160) return 'Large';
+  return 'Medium';
+}
+
+function getAreaTier(area) {
+  if (area <= 2500) return 'Small';
+  if (area <= 7500) return 'Medium';
+  if (area <= 15000) return 'Large';
+  return 'Extra Large';
+}
+
+function calculatePrice(width, height, measurementUnit, productType, quantity, squareMeters, settings) {
+  const qty = quantity || 1;
+
+  if (productType === 'Hardwood Floor') {
+    const floorRate = parseFloat(settings.pricing_floor_rate || 15000);
+    return (squareMeters || 0) * floorRate * qty;
+  }
+
+  const w = measurementUnit === 'inches' ? width * 2.54 : width;
+  const h = measurementUnit === 'inches' ? height * 2.54 : height;
+  const area = w * h;
+  const tier = getAreaTier(area);
+
+  const baseRates = JSON.parse(settings.pricing_base_rates || '{}');
+  const baseRate = baseRates[tier] || 6;
+  let basePrice = area * baseRate;
+
+  if (productType === 'Base Print') {
+    return Math.round(basePrice * qty * 100) / 100;
+  }
+
+  const framingMult = JSON.parse(settings.pricing_framing_multipliers || '{}');
+  let framedPrice = basePrice * (framingMult[tier] || 1.5);
+
+  if (productType === 'Glass Frame') {
+    const glassMult = JSON.parse(settings.pricing_glass_multipliers || '{}');
+    framedPrice = framedPrice * (glassMult[tier] || 1.5);
+  }
+
+  return Math.round(framedPrice * qty * 100) / 100;
+}
+
+function getRequiredStages(productType, settings) {
+  const routing = JSON.parse(settings.production_routing || '{}');
+  return routing[productType] || [];
+}
+
+function getCommission(artisans, stage, sizeTier, settings) {
+  const matrix = JSON.parse(settings.commission_matrix || '{}');
+  const stageRates = matrix[stage] || { 'Small': 0, 'Medium': 0, 'Large': 0 };
+  const rate = stageRates[sizeTier] || 0;
+  const count = Array.isArray(artisans) ? artisans.length : (artisans ? 1 : 0);
+  return {
+    total: rate,
+    split: count > 0 ? Math.round((rate / count) * 100) / 100 : 0,
+    workerCount: count
+  };
+}
+
+module.exports = { calculatePrice, getSizeTier, getRequiredStages, getCommission };
+
+================================================
+FILE: server/src/routes/customers.js
+================================================
+const express = require('express');
+const router = express.Router();
+
+module.exports = router;
+
+router.get('/', (req, res) => {
+  const db = req.app.get('db');
+  const customers = db.prepare(`
+    SELECT c.*,
+      COALESCE((SELECT SUM(r.amount_paid) FROM receipts r JOIN quotes q ON r.quote_id = q.id WHERE q.customer_id = c.id), 0) as total_lifetime_spend,
+      COALESCE((SELECT COUNT(qi.id) FROM quote_items qi JOIN quotes q ON qi.quote_id = q.id WHERE q.customer_id = c.id), 0) as total_frames_ordered,
+      COALESCE((SELECT SUM(q.balance_due) FROM quotes q WHERE q.customer_id = c.id AND q.balance_due > 0), 0) as outstanding_balance
+    FROM customers c ORDER BY c.name
+  `).all();
+  res.json(customers);
+});
+
+router.get('/:id', (req, res) => {
+  const db = req.app.get('db');
+  const customer = db.prepare(`
+    SELECT c.*,
+      COALESCE((SELECT SUM(r.amount_paid) FROM receipts r JOIN quotes q ON r.quote_id = q.id WHERE q.customer_id = c.id), 0) as total_lifetime_spend,
+      COALESCE((SELECT COUNT(qi.id) FROM quote_items qi JOIN quotes q ON qi.quote_id = q.id WHERE q.customer_id = c.id), 0) as total_frames_ordered,
+      COALESCE((SELECT SUM(q.balance_due) FROM quotes q WHERE q.customer_id = c.id AND q.balance_due > 0), 0) as outstanding_balance
+    FROM customers c WHERE c.id = ?
+  `).get(req.params.id);
+  if (!customer) return res.status(404).json({ error: 'Not found' });
+  res.json(customer);
+});
+
+router.post('/', (req, res) => {
+  const db = req.app.get('db');
+  const { name, phone, email, address } = req.body;
+  if (!name) return res.status(400).json({ error: 'Name is required' });
+  const result = db.prepare('INSERT INTO customers (name, phone, email, address) VALUES (?, ?, ?, ?)').run(name, phone || '', email || '', address || '');
+  res.json({ id: result.lastInsertRowid });
+});
+
+router.put('/:id', (req, res) => {
+  const db = req.app.get('db');
+  const { name, phone, email, address } = req.body;
+  db.prepare('UPDATE customers SET name=?, phone=?, email=?, address=? WHERE id=?')
+    .run(name, phone || '', email || '', address || '', req.params.id);
+  res.json({ success: true });
+});
+
+router.delete('/:id', (req, res) => {
+  const db = req.app.get('db');
+  db.prepare('DELETE FROM customers WHERE id=?').run(req.params.id);
+  res.json({ success: true });
+});
+
+================================================
+FILE: server/src/routes/quotes.js
+================================================
+const express = require('express');
+const router = express.Router();
+
+module.exports = router;
+
+router.get('/', (req, res) => {
+  const db = req.app.get('db');
+  const quotes = db.prepare(`
+    SELECT q.*, c.name as customer_name
+    FROM quotes q JOIN customers c ON q.customer_id = c.id
+    ORDER BY q.id DESC
+  `).all();
+  res.json(quotes);
+});
+
+router.get('/:id', (req, res) => {
+  const db = req.app.get('db');
+  const quote = db.prepare(`
+    SELECT q.*, c.name as customer_name, c.phone as customer_phone, c.email as customer_email
+    FROM quotes q JOIN customers c ON q.customer_id = c.id WHERE q.id = ?
+  `).get(req.params.id);
+  if (!quote) return res.status(404).json({ error: 'Not found' });
+  const items = db.prepare('SELECT * FROM quote_items WHERE quote_id = ?').all(req.params.id);
+  const receipts = db.prepare('SELECT * FROM receipts WHERE quote_id = ? ORDER BY payment_date').all(req.params.id);
+  res.json({ ...quote, items, receipts });
+});
+
+router.post('/', (req, res) => {
+  const db = req.app.get('db');
+  const { customer_id, date_created, discount } = req.body;
+  if (!customer_id) return res.status(400).json({ error: 'customer_id is required' });
+  const result = db.prepare('INSERT INTO quotes (customer_id, date_created, discount) VALUES (?, ?, ?)')
+    .run(customer_id, date_created || new Date().toISOString().split('T')[0], discount || 0);
+  res.json({ id: result.lastInsertRowid });
+});
+
+router.put('/:id', (req, res) => {
+  const db = req.app.get('db');
+  const { customer_id, date_created, discount, status } = req.body;
+  const updates = [];
+  const params = [];
+  if (customer_id !== undefined) { updates.push('customer_id=?'); params.push(customer_id); }
+  if (date_created !== undefined) { updates.push('date_created=?'); params.push(date_created); }
+  if (discount !== undefined) { updates.push('discount=?'); params.push(discount); }
+  if (status !== undefined) { updates.push('status=?'); params.push(status); }
+  if (updates.length === 0) return res.status(400).json({ error: 'No fields to update' });
+  params.push(req.params.id);
+  db.prepare(`UPDATE quotes SET ${updates.join(',')} WHERE id=?`).run(...params);
+
+  recalcQuote(db, req.params.id);
+  res.json({ success: true });
+});
+
+router.put('/:id/status', (req, res) => {
+  const db = req.app.get('db');
+  const { status } = req.body;
+  const valid = ['Draft', 'Sent', 'Deposit Paid', 'Send to Production'];
+  if (!valid.includes(status)) return res.status(400).json({ error: 'Invalid status' });
+
+  db.prepare('UPDATE quotes SET status=? WHERE id=?').run(status, req.params.id);
+
+  if (status === 'Send to Production') {
+    const items = db.prepare('SELECT * FROM quote_items WHERE quote_id = ?').all(req.params.id);
+    for (const item of items) {
+      if (item.product_type !== 'Base Print' && item.product_type !== 'Hardwood Floor') {
+        db.prepare("UPDATE quote_items SET production_status='Pending' WHERE id=?").run(item.id);
+      }
+    }
+  }
+
+  recalcQuote(db, req.params.id);
+  res.json({ success: true });
+});
+
+router.delete('/:id', (req, res) => {
+  const db = req.app.get('db');
+  db.prepare('DELETE FROM quotes WHERE id=?').run(req.params.id);
+  res.json({ success: true });
+});
+
+function recalcQuote(db, quoteId) {
+  const items = db.prepare('SELECT calculated_price FROM quote_items WHERE quote_id = ?').all(quoteId);
+  const total = items.reduce((s, i) => s + (i.calculated_price || 0), 0);
+  const quote = db.prepare('SELECT discount, deposit_paid FROM quotes WHERE id=?').get(quoteId);
+  const discount = quote?.discount || 0;
+  const depositPaid = db.prepare('SELECT COALESCE(SUM(amount_paid),0) as total FROM receipts WHERE quote_id=?').get(quoteId)?.total || 0;
+  const grandTotal = total - discount;
+  const balanceDue = grandTotal - depositPaid;
+  db.prepare('UPDATE quotes SET total_amount=?, grand_total=?, deposit_paid=?, balance_due=? WHERE id=?')
+    .run(total, grandTotal, depositPaid, balanceDue, quoteId);
+}
+
+================================================
+FILE: server/src/routes/quoteItems.js
+================================================
+const express = require('express');
+const router = express.Router();
+const { calculatePrice, getSizeTier } = require('../pricing');
+
+module.exports = router;
+
+function getSettings(db) {
+  const rows = db.prepare('SELECT key, value FROM settings').all();
+  const s = {};
+  for (const r of rows) s[r.key] = r.value;
+  return s;
+}
+
+router.get('/by-quote/:quoteId', (req, res) => {
+  const db = req.app.get('db');
+  const items = db.prepare('SELECT * FROM quote_items WHERE quote_id = ? ORDER BY id').all(req.params.quoteId);
+  res.json(items);
+});
+
+router.post('/', (req, res) => {
+  const db = req.app.get('db');
+  const { quote_id, product_type, quantity, measurement_unit, width, height, square_meters } = req.body;
+  if (!quote_id || !product_type) return res.status(400).json({ error: 'quote_id and product_type required' });
+
+  const settings = getSettings(db);
+  const sizeTier = getSizeTier(width || 0, height || 0, measurement_unit || 'cm');
+  const price = calculatePrice(width || 0, height || 0, measurement_unit || 'cm', product_type, quantity || 1, square_meters || 0, settings);
+
+  const result = db.prepare(`INSERT INTO quote_items (quote_id, product_type, quantity, measurement_unit, width, height, square_meters, size_tier, calculated_price)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(quote_id, product_type, quantity || 1, measurement_unit || 'cm', width || null, height || null, square_meters || null, sizeTier, price);
+
+  recalcQuote(db, quote_id);
+  res.json({ id: result.lastInsertRowid, size_tier: sizeTier, calculated_price: price });
+});
+
+router.put('/:id', (req, res) => {
+  const db = req.app.get('db');
+  const { product_type, quantity, measurement_unit, width, height, square_meters } = req.body;
+
+  const item = db.prepare('SELECT * FROM quote_items WHERE id=?').get(req.params.id);
+  if (!item) return res.status(404).json({ error: 'Not found' });
+
+  const settings = getSettings(db);
+  const w = width !== undefined ? width : item.width;
+  const h = height !== undefined ? height : item.height;
+  const mu = measurement_unit || item.measurement_unit;
+  const pt = product_type || item.product_type;
+  const qty = quantity !== undefined ? quantity : item.quantity;
+  const sm = square_meters !== undefined ? square_meters : item.square_meters;
+
+  const sizeTier = getSizeTier(w || 0, h || 0, mu);
+  const price = calculatePrice(w || 0, h || 0, mu, pt, qty || 1, sm || 0, settings);
+
+  db.prepare(`UPDATE quote_items SET product_type=?, quantity=?, measurement_unit=?, width=?, height=?, square_meters=?, size_tier=?, calculated_price=? WHERE id=?`)
+    .run(pt, qty, mu, w, h, sm, sizeTier, price, req.params.id);
+
+  recalcQuote(db, item.quote_id);
+  res.json({ size_tier: sizeTier, calculated_price: price });
+});
+
+router.delete('/:id', (req, res) => {
+  const db = req.app.get('db');
+  const item = db.prepare('SELECT quote_id FROM quote_items WHERE id=?').get(req.params.id);
+  if (!item) return res.status(404).json({ error: 'Not found' });
+  db.prepare('DELETE FROM quote_items WHERE id=?').run(req.params.id);
+  recalcQuote(db, item.quote_id);
+  res.json({ success: true });
+});
+
+function recalcQuote(db, quoteId) {
+  const items = db.prepare('SELECT calculated_price FROM quote_items WHERE quote_id = ?').all(quoteId);
+  const total = items.reduce((s, i) => s + (i.calculated_price || 0), 0);
+  const quote = db.prepare('SELECT discount FROM quotes WHERE id=?').get(quoteId);
+  const discount = quote?.discount || 0;
+  const depositPaid = db.prepare('SELECT COALESCE(SUM(amount_paid),0) as total FROM receipts WHERE quote_id=?').get(quoteId)?.total || 0;
+  const grandTotal = total - discount;
+  const balanceDue = grandTotal - depositPaid;
+  db.prepare('UPDATE quotes SET total_amount=?, grand_total=?, deposit_paid=?, balance_due=? WHERE id=?')
+    .run(total, grandTotal, depositPaid, balanceDue, quoteId);
+}
+
+================================================
+FILE: server/src/routes/productionLogs.js
+================================================
+const express = require('express');
+const router = express.Router();
+const { getCommission, getRequiredStages } = require('../pricing');
+
+module.exports = router;
+
+function getSettings(db) {
+  const rows = db.prepare('SELECT key, value FROM settings').all();
+  const s = {};
+  for (const r of rows) s[r.key] = r.value;
+  return s;
+}
+
+router.get('/', (req, res) => {
+  const db = req.app.get('db');
+  const logs = db.prepare(`
+    SELECT pl.*, qi.product_type, qi.size_tier,
+      q.id as quote_id, c.name as customer_name
+    FROM production_logs pl
+    JOIN quote_items qi ON pl.job_id = qi.id
+    JOIN quotes q ON qi.quote_id = q.id
+    JOIN customers c ON q.customer_id = c.id
+    ORDER BY pl.date_completed DESC, pl.id DESC
+  `).all();
+  res.json(logs);
+});
+
+router.get('/by-job/:jobId', (req, res) => {
+  const db = req.app.get('db');
+  const logs = db.prepare('SELECT * FROM production_logs WHERE job_id = ? ORDER BY date_completed').all(req.params.jobId);
+  res.json(logs);
+});
+
+router.get('/production-jobs', (req, res) => {
+  const db = req.app.get('db');
+  const jobs = db.prepare(`
+    SELECT qi.*, q.id as quote_id, c.name as customer_name,
+      (SELECT COUNT(*) FROM production_logs pl WHERE pl.job_id = qi.id) as logged_stages
+    FROM quote_items qi
+    JOIN quotes q ON qi.quote_id = q.id
+    JOIN customers c ON q.customer_id = c.id
+    WHERE q.status = 'Send to Production'
+    ORDER BY qi.id DESC
+  `).all();
+  const settings = getSettings(db);
+  const result = jobs.map(j => {
+    const required = getRequiredStages(j.product_type, settings);
+    const logged = j.logged_stages || 0;
+    let prodStatus = 'Pending';
+    if (logged > 0 && logged < required.length) prodStatus = 'In Production';
+    else if (logged >= required.length && required.length > 0) prodStatus = 'Complete';
+    return { ...j, required_stages: required.length, logged_stages: logged, production_status: prodStatus };
+  });
+  res.json(result);
+});
+
+router.post('/', (req, res) => {
+  const db = req.app.get('db');
+  const { job_id, stage_completed, artisans, date_completed } = req.body;
+  if (!job_id || !stage_completed || !artisans || !date_completed) {
+    return res.status(400).json({ error: 'job_id, stage_completed, artisans, date_completed required' });
+  }
+
+  const job = db.prepare('SELECT size_tier, product_type FROM quote_items WHERE id=?').get(job_id);
+  if (!job) return res.status(404).json({ error: 'Job not found' });
+
+  const artisanArr = Array.isArray(artisans) ? artisans : [artisans];
+  const settings = getSettings(db);
+  const sizeTier = job.size_tier || 'Medium';
+  const comm = getCommission(artisanArr, stage_completed, sizeTier, settings);
+
+  const result = db.prepare(`INSERT INTO production_logs (job_id, stage_completed, artisans, worker_count, total_stage_commission, split_commission, date_completed, payment_status)
+    VALUES (?, ?, ?, ?, ?, ?, ?, 'Unpaid')`)
+    .run(job_id, stage_completed, JSON.stringify(artisanArr), comm.workerCount, comm.total, comm.split, date_completed);
+
+  updateJobProductionStatus(db, job_id);
+  res.json({ id: result.lastInsertRowid, ...comm });
+});
+
+router.put('/:id/pay', (req, res) => {
+  const db = req.app.get('db');
+  const { payment_status } = req.body;
+  db.prepare("UPDATE production_logs SET payment_status=? WHERE id=?").run(payment_status || 'Paid', req.params.id);
+  res.json({ success: true });
+});
+
+router.put('/pay-all', (req, res) => {
+  const db = req.app.get('db');
+  const { ids } = req.body;
+  if (!Array.isArray(ids) || ids.length === 0) return res.status(400).json({ error: 'ids array required' });
+  const placeholders = ids.map(() => '?').join(',');
+  db.prepare(`UPDATE production_logs SET payment_status='Paid' WHERE id IN (${placeholders})`).run(...ids);
+  res.json({ success: true, count: ids.length });
+});
+
+function updateJobProductionStatus(db, jobId) {
+  const job = db.prepare('SELECT product_type FROM quote_items WHERE id=?').get(jobId);
+  if (!job) return;
+  const settings = getSettings(db);
+  const required = getRequiredStages(job.product_type, settings);
+  const logged = db.prepare('SELECT COUNT(*) as c FROM production_logs WHERE job_id=?').get(jobId).c;
+
+  let status = 'Pending';
+  if (logged > 0 && logged < required.length) status = 'In Production';
+  else if (logged >= required.length && required.length > 0) status = 'Complete';
+
+  db.prepare('UPDATE quote_items SET production_status=? WHERE id=?').run(status, jobId);
+}
+
+================================================
+FILE: server/src/routes/receipts.js
+================================================
+const express = require('express');
+const router = express.Router();
+
+module.exports = router;
+
+router.get('/by-quote/:quoteId', (req, res) => {
+  const db = req.app.get('db');
+  const receipts = db.prepare('SELECT * FROM receipts WHERE quote_id = ? ORDER BY payment_date').all(req.params.quoteId);
+  res.json(receipts);
+});
+
+router.post('/', (req, res) => {
+  const db = req.app.get('db');
+  const { quote_id, payment_date, amount_paid, payment_method } = req.body;
+  if (!quote_id || !amount_paid) return res.status(400).json({ error: 'quote_id and amount_paid required' });
+  const result = db.prepare('INSERT INTO receipts (quote_id, payment_date, amount_paid, payment_method) VALUES (?, ?, ?, ?)')
+    .run(quote_id, payment_date || new Date().toISOString().split('T')[0], amount_paid, payment_method || 'Cash');
+  updateQuoteBalance(db, quote_id);
+  res.json({ id: result.lastInsertRowid });
+});
+
+router.delete('/:id', (req, res) => {
+  const db = req.app.get('db');
+  const receipt = db.prepare('SELECT quote_id FROM receipts WHERE id=?').get(req.params.id);
+  if (!receipt) return res.status(404).json({ error: 'Not found' });
+  db.prepare('DELETE FROM receipts WHERE id=?').run(req.params.id);
+  updateQuoteBalance(db, receipt.quote_id);
+  res.json({ success: true });
+});
+
+function updateQuoteBalance(db, quoteId) {
+  const items = db.prepare('SELECT COALESCE(SUM(calculated_price),0) as total FROM quote_items WHERE quote_id=?').get(quoteId);
+  const total = items.total || 0;
+  const quote = db.prepare('SELECT discount FROM quotes WHERE id=?').get(quoteId);
+  const discount = quote?.discount || 0;
+  const depositPaid = db.prepare('SELECT COALESCE(SUM(amount_paid),0) as total FROM receipts WHERE quote_id=?').get(quoteId)?.total || 0;
+  const grandTotal = total - discount;
+  const balanceDue = grandTotal - depositPaid;
+  db.prepare('UPDATE quotes SET total_amount=?, grand_total=?, deposit_paid=?, balance_due=? WHERE id=?')
+    .run(total, grandTotal, depositPaid, balanceDue, quoteId);
+}
+
+================================================
+FILE: server/src/routes/settings.js
+================================================
+const express = require('express');
+const router = express.Router();
+
+module.exports = router;
+
+router.get('/', (req, res) => {
+  const db = req.app.get('db');
+  const rows = db.prepare('SELECT key, value FROM settings').all();
+  const obj = {};
+  for (const r of rows) {
+    try { obj[r.key] = JSON.parse(r.value); }
+    catch { obj[r.key] = r.value; }
+  }
+  res.json(obj);
+});
+
+router.put('/', (req, res) => {
+  const db = req.app.get('db');
+  const { key, value } = req.body;
+  if (!key) return res.status(400).json({ error: 'key required' });
+  const val = typeof value === 'object' ? JSON.stringify(value) : String(value);
+  db.prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)').run(key, val);
+  res.json({ success: true });
+});
+
+================================================
+FILE: server/src/routes/dashboard.js
+================================================
+const express = require('express');
+const router = express.Router();
+
+module.exports = router;
+
+router.get('/', (req, res) => {
+  const db = req.app.get('db');
+
+  const totalRevenue = db.prepare("SELECT COALESCE(SUM(amount_paid),0) as total FROM receipts").get().total;
+  const outstandingPayroll = db.prepare("SELECT COALESCE(SUM(split_commission),0) as total FROM production_logs WHERE payment_status='Unpaid'").get().total;
+  const totalQuotes = db.prepare("SELECT COUNT(*) as c FROM quotes").get().c;
+  const approvedQuotes = db.prepare("SELECT COUNT(*) as c FROM quotes WHERE status IN ('Deposit Paid','Send to Production')").get().c;
+  const totalJobs = db.prepare("SELECT COUNT(*) as c FROM quote_items").get().c;
+  const activeJobs = db.prepare(`
+    SELECT COUNT(*) as c FROM quote_items qi
+    JOIN quotes q ON qi.quote_id = q.id
+    WHERE q.status = 'Send to Production' AND qi.production_status IN ('Pending','In Production')
+  `).get().c;
+
+  const productionStages = db.prepare(`
+    SELECT stage_completed, COUNT(*) as count
+    FROM production_logs
+    WHERE payment_status='Unpaid'
+    GROUP BY stage_completed ORDER BY count DESC
+  `).all();
+
+  const recentQuotes = db.prepare(`
+    SELECT q.*, c.name as customer_name
+    FROM quotes q JOIN customers c ON q.customer_id = c.id
+    ORDER BY q.id DESC LIMIT 5
+  `).all();
+
+  const weeklyPayroll = db.prepare(`
+    SELECT COALESCE(SUM(split_commission),0) as total
+    FROM production_logs
+    WHERE payment_status='Unpaid'
+      AND date_completed >= date('now', 'weekday 0', '-7 days')
+      AND date_completed < date('now', 'weekday 0')
+  `).get().total;
+
+  res.json({
+    total_revenue: totalRevenue,
+    outstanding_payroll: outstandingPayroll,
+    total_quotes: totalQuotes,
+    approved_quotes: approvedQuotes,
+    total_jobs: totalJobs,
+    active_jobs: activeJobs,
+    production_stages: productionStages,
+    recent_quotes: recentQuotes,
+    weekly_payroll_due: weeklyPayroll
+  });
+});
+
+================================================
+FILE: server/src/routes/payroll.js
+================================================
+const express = require('express');
+const router = express.Router();
+
+module.exports = router;
+
+router.get('/weekly', (req, res) => {
+  const db = req.app.get('db');
+  const { start_date, end_date, payment_status } = req.query;
+
+  const start = start_date || getWeekStart();
+  const end = end_date || getWeekEnd();
+  const statusFilter = payment_status || 'Unpaid';
+
+  const logs = db.prepare(`
+    SELECT pl.*, qi.product_type, qi.size_tier,
+      q.id as quote_id, c.name as customer_name,
+      qi.id as job_display_id
+    FROM production_logs pl
+    JOIN quote_items qi ON pl.job_id = qi.id
+    JOIN quotes q ON qi.quote_id = q.id
+    JOIN customers c ON q.customer_id = c.id
+    WHERE pl.date_completed >= ? AND pl.date_completed <= ?
+      AND pl.payment_status = ?
+    ORDER BY pl.date_completed, pl.id
+  `).all(start, end, statusFilter);
+
+  const byArtisan = {};
+  for (const log of logs) {
+    const artisans = JSON.parse(log.artisans || '[]');
+    for (const artisan of artisans) {
+      if (!byArtisan[artisan]) byArtisan[artisan] = { stages: [], total: 0, count: 0 };
+      byArtisan[artisan].stages.push(log);
+      byArtisan[artisan].total += log.split_commission;
+      byArtisan[artisan].count += 1;
+    }
+  }
+
+  res.json({ start_date: start, end_date: end, logs, by_artisan: byArtisan });
+});
+
+router.get('/history', (req, res) => {
+  const db = req.app.get('db');
+  const { artisan, month, year } = req.query;
+  let query = `
+    SELECT pl.*, qi.product_type, qi.size_tier
+    FROM production_logs pl
+    JOIN quote_items qi ON pl.job_id = qi.id
+    WHERE pl.payment_status = 'Paid'
+  `;
+  const params = [];
+  if (artisan) { query += ' AND pl.artisans LIKE ?'; params.push(`%"${artisan}"%`); }
+  if (month && year) {
+    const m = String(month).padStart(2, '0');
+    query += ' AND pl.date_completed >= ? AND pl.date_completed <= ?';
+    params.push(`${year}-${m}-01`, `${year}-${m}-31`);
+  }
+  query += ' ORDER BY pl.date_completed DESC';
+  const logs = db.prepare(query).all(...params);
+  res.json(logs);
+});
+
+function getWeekStart() {
+  const now = new Date();
+  const day = now.getDay();
+  const diff = now.getDate() - day + (day === 0 ? -6 : 1);
+  const monday = new Date(now.setDate(diff));
+  return monday.toISOString().split('T')[0];
+}
+
+function getWeekEnd() {
+  const now = new Date();
+  const day = now.getDay();
+  const diff = now.getDate() - day + (day === 0 ? 0 : 7);
+  const sunday = new Date(now.setDate(diff));
+  return sunday.toISOString().split('T')[0];
+}
+
+================================================
+FILE: server/src/routes/reports.js
+================================================
+const express = require('express');
+const router = express.Router();
+
+module.exports = router;
+
+router.get('/sales', (req, res) => {
+  const db = req.app.get('db');
+  const { month, year } = req.query;
+  const m = month ? String(month).padStart(2, '0') : String(new Date().getMonth() + 1).padStart(2, '0');
+  const y = year || String(new Date().getFullYear());
+  const startDate = `${y}-${m}-01`;
+  const endDate = `${y}-${m}-31`;
+
+  const quotesSent = db.prepare("SELECT COUNT(*) as c FROM quotes WHERE date_created >= ? AND date_created <= ?").get(startDate, endDate).c;
+  const quotesApproved = db.prepare("SELECT COUNT(*) as c FROM quotes WHERE status IN ('Deposit Paid','Send to Production') AND date_created >= ? AND date_created <= ?").get(startDate, endDate).c;
+  const revenueCollected = db.prepare("SELECT COALESCE(SUM(amount_paid),0) as total FROM receipts WHERE payment_date >= ? AND payment_date <= ?").get(startDate, endDate).total;
+
+  const dailyRevenue = db.prepare(`
+    SELECT payment_date, SUM(amount_paid) as total
+    FROM receipts WHERE payment_date >= ? AND payment_date <= ?
+    GROUP BY payment_date ORDER BY payment_date
+  `).all(startDate, endDate);
+
+  res.json({ month: parseInt(m), year: parseInt(y), quotes_sent: quotesSent, quotes_approved: quotesApproved, revenue_collected: revenueCollected, daily_revenue: dailyRevenue });
+});
+
+router.get('/production', (req, res) => {
+  const db = req.app.get('db');
+  const { month, year } = req.query;
+  const m = month ? String(month).padStart(2, '0') : String(new Date().getMonth() + 1).padStart(2, '0');
+  const y = year || String(new Date().getFullYear());
+  const startDate = `${y}-${m}-01`;
+  const endDate = `${y}-${m}-31`;
+
+  const totalFrames = db.prepare(`
+    SELECT COUNT(*) as c FROM quote_items qi
+    JOIN quotes q ON qi.quote_id = q.id
+    WHERE qi.product_type IN ('Base Print','Stretch Canvas','Floating Frame','Glass Frame')
+      AND q.date_created >= ? AND q.date_created <= ?
+  `).get(startDate, endDate).c;
+
+  const totalFloor = db.prepare(`
+    SELECT COALESCE(SUM(qi.square_meters),0) as total FROM quote_items qi
+    JOIN quotes q ON qi.quote_id = q.id
+    WHERE qi.product_type = 'Hardwood Floor' AND q.date_created >= ? AND q.date_created <= ?
+  `).get(startDate, endDate).total;
+
+  const byProductType = db.prepare(`
+    SELECT qi.product_type, COUNT(*) as count
+    FROM quote_items qi JOIN quotes q ON qi.quote_id = q.id
+    WHERE q.date_created >= ? AND q.date_created <= ?
+    GROUP BY qi.product_type
+  `).all(startDate, endDate);
+
+  res.json({ month: parseInt(m), year: parseInt(y), total_frames: totalFrames, total_floor_sqm: totalFloor, by_product_type: byProductType });
+});
+
+router.get('/artisans', (req, res) => {
+  const db = req.app.get('db');
+  const { month, year } = req.query;
+  const m = month ? String(month).padStart(2, '0') : String(new Date().getMonth() + 1).padStart(2, '0');
+  const y = year || String(new Date().getFullYear());
+  const startDate = `${y}-${m}-01`;
+  const endDate = `${y}-${m}-31`;
+
+  const allLogs = db.prepare(`
+    SELECT * FROM production_logs
+    WHERE payment_status = 'Paid' AND date_completed >= ? AND date_completed <= ?
+  `).all(startDate, endDate);
+
+  const byArtisan = {};
+  for (const log of allLogs) {
+    const artisans = JSON.parse(log.artisans || '[]');
+    for (const a of artisans) {
+      if (!byArtisan[a]) byArtisan[a] = { artisan: a, stages_completed: 0, total_earned: 0 };
+      byArtisan[a].stages_completed += 1;
+      byArtisan[a].total_earned += log.split_commission || 0;
+    }
+  }
+
+  const leaderboard = Object.values(byArtisan).sort((a, b) => b.total_earned - a.total_earned);
+  const totalPayroll = leaderboard.reduce((s, a) => s + a.total_earned, 0);
+
+  res.json({ month: parseInt(m), year: parseInt(y), total_payroll: totalPayroll, leaderboard });
+});
+
+================================================
+FILE: client/vite.config.js
+================================================
+import { defineConfig } from 'vite';
+import react from '@vitejs/plugin-react';
+
+export default defineConfig({
+  plugins: [react()],
+  server: {
+    port: 5173,
+    proxy: { '/api': 'http://localhost:3001' }
+  }
+});
+
+================================================
+FILE: client/index.html
+================================================
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Framing ERP - Admin Control Tower</title>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:opsz@14..32&display=swap" rel="stylesheet">
+</head>
+<body>
+  <div id="root"></div>
+  <script type="module" src="/src/main.jsx"></script>
+</body>
+</html>
+
+================================================
+FILE: client/src/main.jsx
+================================================
+import React from 'react';
+import ReactDOM from 'react-dom/client';
+import { BrowserRouter } from 'react-router-dom';
+import App from './App';
+import './styles/global.css';
+
+ReactDOM.createRoot(document.getElementById('root')).render(
+  <BrowserRouter>
+    <App />
+  </BrowserRouter>
+);
+
+================================================
+FILE: client/src/App.jsx
+================================================
+import { Routes, Route } from 'react-router-dom';
+import Sidebar from './components/Sidebar';
+import Dashboard from './pages/Dashboard';
+import Customers from './pages/Customers';
+import Quotes from './pages/Quotes';
+import QuoteDetail from './pages/QuoteDetail';
+import Production from './pages/Production';
+import Payroll from './pages/Payroll';
+import Receipts from './pages/Receipts';
+import Reports from './pages/Reports';
+import Settings from './pages/Settings';
+
+export default function App() {
+  return (
+    <div className="layout">
+      <Sidebar />
+      <main className="main">
+        <Routes>
+          <Route path="/" element={<Dashboard />} />
+          <Route path="/customers" element={<Customers />} />
+          <Route path="/quotes" element={<Quotes />} />
+          <Route path="/quotes/:id" element={<QuoteDetail />} />
+          <Route path="/production" element={<Production />} />
+          <Route path="/payroll" element={<Payroll />} />
+          <Route path="/receipts" element={<Receipts />} />
+          <Route path="/reports" element={<Reports />} />
+          <Route path="/settings" element={<Settings />} />
+        </Routes>
+      </main>
+    </div>
+  );
+}
+
+================================================
+FILE: client/src/api.js
+================================================
+const BASE = '/api';
+
+async function request(method, path, body) {
+  const opts = { method, headers: { 'Content-Type': 'application/json' } };
+  if (body) opts.body = JSON.stringify(body);
+  const res = await fetch(BASE + path, opts);
+  if (!res.ok) { const e = await res.json().catch(() => ({error:res.statusText})); throw new Error(e.error || res.statusText); }
+  return res.json();
+}
+
+export const api = {
+  customers: {
+    list: () => request('GET', '/customers'),
+    get: (id) => request('GET', `/customers/${id}`),
+    create: (data) => request('POST', '/customers', data),
+    update: (id, data) => request('PUT', `/customers/${id}`, data),
+    delete: (id) => request('DELETE', `/customers/${id}`)
+  },
+  quotes: {
+    list: () => request('GET', '/quotes'),
+    get: (id) => request('GET', `/quotes/${id}`),
+    create: (data) => request('POST', '/quotes', data),
+    update: (id, data) => request('PUT', `/quotes/${id}`, data),
+    updateStatus: (id, status) => request('PUT', `/quotes/${id}/status`, { status }),
+    delete: (id) => request('DELETE', `/quotes/${id}`)
+  },
+  quoteItems: {
+    byQuote: (quoteId) => request('GET', `/quote-items/by-quote/${quoteId}`),
+    create: (data) => request('POST', '/quote-items', data),
+    update: (id, data) => request('PUT', `/quote-items/${id}`, data),
+    delete: (id) => request('DELETE', `/quote-items/${id}`)
+  },
+  productionLogs: {
+    list: () => request('GET', '/production-logs'),
+    byJob: (jobId) => request('GET', `/production-logs/by-job/${jobId}`),
+    productionJobs: () => request('GET', '/production-logs/production-jobs'),
+    create: (data) => request('POST', '/production-logs', data),
+    pay: (id) => request('PUT', `/production-logs/${id}/pay`, { payment_status: 'Paid' }),
+    payAll: (ids) => request('PUT', '/production-logs/pay-all', { ids })
+  },
+  receipts: {
+    byQuote: (quoteId) => request('GET', `/receipts/by-quote/${quoteId}`),
+    create: (data) => request('POST', '/receipts', data),
+    delete: (id) => request('DELETE', `/receipts/${id}`)
+  },
+  settings: {
+    get: () => request('GET', '/settings'),
+    update: (key, value) => request('PUT', '/settings', { key, value })
+  },
+  dashboard: {
+    get: () => request('GET', '/dashboard')
+  },
+  payroll: {
+    weekly: (params) => {
+      const q = new URLSearchParams(params || {}).toString();
+      return request('GET', `/payroll/weekly${q ? '?'+q : ''}`);
+    },
+    history: (params) => {
+      const q = new URLSearchParams(params || {}).toString();
+      return request('GET', `/payroll/history${q ? '?'+q : ''}`);
+    }
+  },
+  reports: {
+    sales: (month, year) => request('GET', `/reports/sales?month=${month}&year=${year}`),
+    production: (month, year) => request('GET', `/reports/production?month=${month}&year=${year}`),
+    artisans: (month, year) => request('GET', `/reports/artisans?month=${month}&year=${year}`)
+  }
+};
+
+================================================
+FILE: client/src/styles/global.css
+================================================
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+:root {
+  --sidebar: #1a1f2e;
+  --sidebar-hover: #242b3d;
+  --sidebar-active: #2e3a5c;
+  --primary: #2563eb;
+  --primary-hover: #1d4ed8;
+  --green: #16a34a;
+  --red: #dc2626;
+  --amber: #d97706;
+  --bg: #f3f4f6;
+  --card: #ffffff;
+  --border: #e5e7eb;
+  --text: #111827;
+  --text-secondary: #6b7280;
+  --text-muted: #9ca3af;
+  --font: 'Inter', -apple-system, sans-serif;
+}
+html { font-size: 13px; }
+body {
+  font-family: var(--font);
+  background: var(--bg);
+  color: var(--text);
+  line-height: 1.5;
+}
+a { color: var(--primary); text-decoration: none; }
+
+.layout { display: flex; min-height: 100vh; }
+
+/* Sidebar */
+.sidebar {
+  width: 220px; background: var(--sidebar); color: #fff;
+  display: flex; flex-direction: column; flex-shrink: 0;
+  position: fixed; top: 0; left: 0; height: 100vh; z-index: 100;
+}
+.sidebar-header {
+  padding: 16px 20px; border-bottom: 1px solid rgba(255,255,255,0.08);
+  font-size: 15px; font-weight: 700; letter-spacing: 0.3px;
+  color: #e0e7ff; white-space: nowrap;
+}
+.sidebar-header small { display: block; font-size: 10px; font-weight: 400; color: var(--text-muted); margin-top: 2px; }
+.sidebar-nav { flex: 1; padding: 8px 0; overflow-y: auto; }
+.sidebar-link {
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px 20px; color: #a0aec0; font-size: 12.5px;
+  transition: all 0.15s; cursor: pointer; border: none; background: none;
+  width: 100%; text-align: left;
+}
+.sidebar-link:hover { background: var(--sidebar-hover); color: #e2e8f0; }
+.sidebar-link.active { background: var(--sidebar-active); color: #fff; border-right: 3px solid var(--primary); }
+.sidebar-link .icon { font-size: 16px; width: 20px; text-align: center; }
+
+/* Main Content */
+.main { margin-left: 220px; flex: 1; padding: 24px 32px; max-width: calc(100vw - 220px); }
+.page-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 24px; }
+.page-header h1 { font-size: 20px; font-weight: 600; color: var(--text); }
+
+/* Cards */
+.card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 20px; }
+.card + .card { margin-top: 16px; }
+
+/* KPI Grid */
+.kpi-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin-bottom: 24px; }
+.kpi-card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 16px 20px; }
+.kpi-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-muted); margin-bottom: 4px; }
+.kpi-value { font-size: 24px; font-weight: 700; color: var(--text); }
+.kpi-value.green { color: var(--green); }
+.kpi-value.red { color: var(--red); }
+.kpi-value.amber { color: var(--amber); }
+.kpi-value.blue { color: var(--primary); }
+
+/* Tables */
+.table-wrap { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+thead { background: #f9fafb; }
+th { padding: 8px 10px; text-align: left; font-weight: 600; color: var(--text-secondary); border-bottom: 2px solid var(--border); white-space: nowrap; }
+td { padding: 8px 10px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+tr:hover td { background: #f9fafb; }
+
+/* Buttons */
+.btn {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 6px 14px; border-radius: 6px; font-size: 12px; font-weight: 500;
+  border: 1px solid var(--border); cursor: pointer; transition: all 0.15s;
+  background: var(--card); color: var(--text); white-space: nowrap;
+}
+.btn:hover { background: #f3f4f6; }
+.btn-primary { background: var(--primary); color: #fff; border-color: var(--primary); }
+.btn-primary:hover { background: var(--primary-hover); }
+.btn-green { background: var(--green); color: #fff; border-color: var(--green); }
+.btn-green:hover { background: #15803d; }
+.btn-red { background: var(--red); color: #fff; border-color: var(--red); }
+.btn-red:hover { background: #b91c1c; }
+.btn-sm { padding: 4px 10px; font-size: 11px; }
+.btn-ghost { background: transparent; border-color: transparent; color: var(--text-secondary); }
+.btn-ghost:hover { background: #f3f4f6; color: var(--text); }
+
+/* Forms */
+.form-group { margin-bottom: 14px; }
+.form-group label { display: block; font-size: 12px; font-weight: 500; color: var(--text-secondary); margin-bottom: 4px; }
+.form-control {
+  width: 100%; padding: 7px 10px; font-size: 13px; font-family: var(--font);
+  border: 1px solid var(--border); border-radius: 6px; background: #fff;
+  transition: border-color 0.15s; outline: none;
+}
+.form-control:focus { border-color: var(--primary); box-shadow: 0 0 0 3px rgba(37,99,235,0.1); }
+select.form-control { appearance: auto; }
+.form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+
+/* Badges */
+.badge {
+  display: inline-block; padding: 2px 8px; border-radius: 10px;
+  font-size: 11px; font-weight: 500; white-space: nowrap;
+}
+.badge-draft { background: #f3f4f6; color: var(--text-secondary); }
+.badge-sent { background: #dbeafe; color: #1d4ed8; }
+.badge-deposit { background: #fef3c7; color: #92400e; }
+.badge-production { background: #d1fae5; color: #065f46; }
+.badge-pending { background: #f3f4f6; color: var(--text-secondary); }
+.badge-progress { background: #dbeafe; color: #1d4ed8; }
+.badge-complete { background: #d1fae5; color: #065f46; }
+.badge-unpaid { background: #fee2e2; color: #991b1b; }
+.badge-paid { background: #d1fae5; color: #065f46; }
+
+/* Modal */
+.modal-overlay {
+  position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+  background: rgba(0,0,0,0.4); display: flex; align-items: center; justify-content: center;
+  z-index: 1000;
+}
+.modal {
+  background: var(--card); border-radius: 10px; width: 520px; max-width: 90vw;
+  max-height: 85vh; overflow-y: auto; box-shadow: 0 20px 60px rgba(0,0,0,0.2);
+}
+.modal-header { display: flex; align-items: center; justify-content: space-between; padding: 16px 20px; border-bottom: 1px solid var(--border); }
+.modal-header h2 { font-size: 15px; font-weight: 600; }
+.modal-body { padding: 20px; }
+.modal-footer { display: flex; justify-content: flex-end; gap: 8px; padding: 12px 20px; border-top: 1px solid var(--border); }
+
+/* Utility */
+.flex { display: flex; }
+.flex-between { display: flex; align-items: center; justify-content: space-between; }
+.gap-2 { gap: 8px; }
+.gap-4 { gap: 16px; }
+.mb-4 { margin-bottom: 16px; }
+.mt-4 { margin-top: 16px; }
+.text-right { text-align: right; }
+.text-muted { color: var(--text-muted); }
+.text-sm { font-size: 12px; }
+.font-bold { font-weight: 600; }
+.truncate { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* Inline form for quick entry */
+.inline-form { display: grid; grid-template-columns: 1fr 1fr 1fr 1fr auto; gap: 8px; align-items: end; }
+
+/* Payroll artisan block */
+.artisan-block { background: var(--card); border: 1px solid var(--border); border-radius: 8px; margin-bottom: 16px; }
+.artisan-header { display: flex; align-items: center; justify-content: space-between; padding: 12px 16px; background: #f9fafb; border-bottom: 1px solid var(--border); border-radius: 8px 8px 0 0; }
+.artisan-name { font-size: 14px; font-weight: 600; }
+.artisan-summary { display: flex; gap: 24px; font-size: 12px; }
+.artisan-summary span { color: var(--text-secondary); }
+.artisan-summary strong { color: var(--text); }
+
+/* Chart wrapper */
+.chart-wrap { width: 100%; height: 250px; margin-top: 12px; }
+
+/* Stage progress bar */
+.progress-bar { display: flex; gap: 4px; margin: 4px 0; }
+.progress-dot { width: 12px; height: 12px; border-radius: 50%; background: var(--border); }
+.progress-dot.done { background: var(--green); }
+.progress-dot.active { background: var(--primary); }
+
+/* Filter bar */
+.filter-bar { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; flex-wrap: wrap; }
+.filter-bar label { font-size: 12px; color: var(--text-secondary); }
+.filter-bar input, .filter-bar select { padding: 5px 8px; font-size: 12px; border: 1px solid var(--border); border-radius: 4px; }
+
+@media (max-width: 768px) {
+  .sidebar { width: 50px; }
+  .sidebar-header span, .sidebar-link span:not(.icon) { display: none; }
+  .main { margin-left: 50px; padding: 16px; max-width: calc(100vw - 50px); }
+  .form-row { grid-template-columns: 1fr; }
+  .kpi-grid { grid-template-columns: 1fr 1fr; }
+}
+
+================================================
+FILE: client/src/components/Sidebar.jsx
+================================================
+import { NavLink } from 'react-router-dom';
+
+const links = [
+  { to: '/', icon: '\u2302', label: 'Dashboard' },
+  { to: '/customers', icon: '\U0001F465', label: 'Customers' },
+  { to: '/quotes', icon: '\U0001F4B0', label: 'Quotes' },
+  { to: '/production', icon: '\u2699', label: 'Production' },
+  { to: '/payroll', icon: '\U0001F4B5', label: 'Payroll' },
+  { to: '/receipts', icon: '\U0001F4CB', label: 'Receipts' },
+  { to: '/reports', icon: '\U0001F4CA', label: 'Reports' },
+  { to: '/settings', icon: '\u2699', label: 'Settings' },
+];
+
+export default function Sidebar() {
+  return (
+    <aside className="sidebar">
+      <div className="sidebar-header">
+        <span>FRAMING ERP</span>
+        <small>Admin Control Tower</small>
+      </div>
+      <nav className="sidebar-nav">
+        {links.map(l => (
+          <NavLink key={l.to} to={l.to} end={l.to === '/'}
+            className={({ isActive }) => 'sidebar-link' + (isActive ? ' active' : '')}>
+            <span className="icon">{l.icon}</span>
+            <span>{l.label}</span>
+          </NavLink>
+        ))}
+      </nav>
+    </aside>
+  );
+}
+
+================================================
+FILE: client/src/components/Modal.jsx
+================================================
+export default function Modal({ title, children, onClose, footer }) {
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal" onClick={e => e.stopPropagation()}>
+        <div className="modal-header">
+          <h2>{title}</h2>
+          <button className="btn btn-ghost btn-sm" onClick={onClose}>&times;</button>
+        </div>
+        <div className="modal-body">{children}</div>
+        {footer && <div className="modal-footer">{footer}</div>}
+      </div>
+    </div>
+  );
+}
+
+================================================
+FILE: client/src/pages/Dashboard.jsx
+================================================
+import { useState, useEffect } from 'react';
+import { Link } from 'react-router-dom';
+import { PieChart, Pie, Cell, ResponsiveContainer, Tooltip } from 'recharts';
+import { api } from '../api';
+
+const COLORS = ['#2563eb','#16a34a','#d97706','#dc2626','#8b5cf6','#06b6d4','#f43f5e'];
+
+export default function Dashboard() {
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    api.dashboard.get().then(setData).finally(() => setLoading(false));
+  }, []);
+
+  if (loading) return <div>Loading...</div>;
+  if (!data) return null;
+
+  return (
+    <>
+      <div className="page-header"><h1>Dashboard</h1></div>
+
+      <div className="kpi-grid">
+        <div className="kpi-card">
+          <div className="kpi-label">Total Revenue</div>
+          <div className="kpi-value green">\u20A6{Number(data.total_revenue).toLocaleString()}</div>
+        </div>
+        <div className="kpi-card">
+          <div className="kpi-label">Outstanding Payroll</div>
+          <div className="kpi-value red">\u20A6{Number(data.outstanding_payroll).toLocaleString()}</div>
+        </div>
+        <div className="kpi-card">
+          <div className="kpi-label">This Week Payroll Due</div>
+          <div className="kpi-value amber">\u20A6{Number(data.weekly_payroll_due).toLocaleString()}</div>
+        </div>
+        <div className="kpi-card">
+          <div className="kpi-label">Active Jobs</div>
+          <div className="kpi-value blue">{data.active_jobs}</div>
+        </div>
+        <div className="kpi-card">
+          <div className="kpi-label">Total Quotes</div>
+          <div className="kpi-value">{data.total_quotes}</div>
+        </div>
+        <div className="kpi-card">
+          <div className="kpi-label">Approved / Deposits</div>
+          <div className="kpi-value">{data.approved_quotes}</div>
+        </div>
+      </div>
+
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
+        <div className="card">
+          <h3 style={{ fontSize: 14, marginBottom: 12 }}>Active Jobs by Stage</h3>
+          {data.production_stages.length === 0 ? (
+            <div className="text-muted text-sm">No active production stages</div>
+          ) : (
+            <ResponsiveContainer width="100%" height={250}>
+              <PieChart>
+                <Pie data={data.production_stages} dataKey="count" nameKey="stage_completed" cx="50%" cy="50%" outerRadius={90} label={({stage_completed, count}) => `${stage_completed} (${count})`}>
+                  {data.production_stages.map((_, i) => <Cell key={i} fill={COLORS[i % COLORS.length]} />)}
+                </Pie>
+                <Tooltip />
+              </PieChart>
+            </ResponsiveContainer>
+          )}
+        </div>
+
+        <div className="card">
+          <h3 style={{ fontSize: 14, marginBottom: 12 }}>Recent Quotes</h3>
+          <table>
+            <thead>
+              <tr><th>ID</th><th>Customer</th><th>Total</th><th>Status</th></tr>
+            </thead>
+            <tbody>
+              {data.recent_quotes.map(q => (
+                <tr key={q.id}>
+                  <td><Link to={`/quotes/${q.id}`}>#{q.id}</Link></td>
+                  <td>{q.customer_name}</td>
+                  <td>\u20A6{Number(q.grand_total).toLocaleString()}</td>
+                  <td><span className={`badge badge-${q.status === 'Draft' ? 'draft' : q.status === 'Sent' ? 'sent' : q.status === 'Deposit Paid' ? 'deposit' : 'production'}`}>{q.status}</span></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </>
+  );
+}
+
+================================================
+FILE: client/src/pages/Customers.jsx
+================================================
+import { useState, useEffect } from 'react';
+import { api } from '../api';
+import Modal from '../components/Modal';
+
+export default function Customers() {
+  const [customers, setCustomers] = useState([]);
+  const [showModal, setShowModal] = useState(false);
+  const [edit, setEdit] = useState(null);
+  const [form, setForm] = useState({ name: '', phone: '', email: '', address: '' });
+
+  useEffect(() => { load(); }, []);
+
+  function load() { api.customers.list().then(setCustomers); }
+
+  function openCreate() { setEdit(null); setForm({ name: '', phone: '', email: '', address: '' }); setShowModal(true); }
+
+  function openEdit(c) { setEdit(c); setForm({ name: c.name, phone: c.phone, email: c.email, address: c.address }); setShowModal(true); }
+
+  function save() {
+    if (!form.name) return;
+    const p = edit ? api.customers.update(edit.id, form) : api.customers.create(form);
+    p.then(() => { setShowModal(false); load(); });
+  }
+
+  function del(id) { if (confirm('Delete this customer?')) api.customers.delete(id).then(load); }
+
+  return (
+    <>
+      <div className="page-header">
+        <h1>Customers (CRM)</h1>
+        <button className="btn btn-primary" onClick={openCreate}>+ New Customer</button>
+      </div>
+
+      <div className="card">
+        <div className="table-wrap">
+          <table>
+            <thead>
+              <tr><th>Name</th><th>Phone</th><th>Email</th><th>Lifetime Spend</th><th>Frames Ordered</th><th>Outstanding</th><th></th></tr>
+            </thead>
+            <tbody>
+              {customers.map(c => (
+                <tr key={c.id}>
+                  <td className="font-bold">{c.name}</td>
+                  <td>{c.phone}</td>
+                  <td>{c.email}</td>
+                  <td>\u20A6{Number(c.total_lifetime_spend || 0).toLocaleString()}</td>
+                  <td>{c.total_frames_ordered || 0}</td>
+                  <td>\u20A6{Number(c.outstanding_balance || 0).toLocaleString()}</td>
+                  <td>
+                    <button className="btn btn-ghost btn-sm" onClick={() => openEdit(c)}>Edit</button>
+                    <button className="btn btn-ghost btn-sm" onClick={() => del(c.id)}>Del</button>
+                  </td>
+                </tr>
+              ))}
+              {customers.length === 0 && <tr><td colSpan={7} className="text-muted text-sm">No customers yet</td></tr>}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {showModal && (
+        <Modal title={edit ? 'Edit Customer' : 'New Customer'} onClose={() => setShowModal(false)}
+          footer={<><button className="btn btn-ghost" onClick={() => setShowModal(false)}>Cancel</button><button className="btn btn-primary" onClick={save}>Save</button></>}>
+          <div className="form-group">
+            <label>Customer Name *</label>
+            <input className="form-control" value={form.name} onChange={e => setForm({...form, name: e.target.value})} />
+          </div>
+          <div className="form-row">
+            <div className="form-group">
+              <label>Phone</label>
+              <input className="form-control" value={form.phone} onChange={e => setForm({...form, phone: e.target.value})} />
+            </div>
+            <div className="form-group">
+              <label>Email</label>
+              <input className="form-control" value={form.email} onChange={e => setForm({...form, email: e.target.value})} />
+            </div>
+          </div>
+          <div className="form-group">
+            <label>Address</label>
+            <textarea className="form-control" rows={3} value={form.address} onChange={e => setForm({...form, address: e.target.value})} />
+          </div>
+        </Modal>
+      )}
+    </>
+  );
+}
+
+================================================
+FILE: client/src/pages/Quotes.jsx
+================================================
+import { useState, useEffect } from 'react';
+import { Link, useNavigate } from 'react-router-dom';
+import { api } from '../api';
+import Modal from '../components/Modal';
+
+const statusBadge = { 'Draft': 'badge-draft', 'Sent': 'badge-sent', 'Deposit Paid': 'badge-deposit', 'Send to Production': 'badge-production' };
+
+export default function Quotes() {
+  const [quotes, setQuotes] = useState([]);
+  const [customers, setCustomers] = useState([]);
+  const [showCreate, setShowCreate] = useState(false);
+  const [customerId, setCustomerId] = useState('');
+  const navigate = useNavigate();
+
+  useEffect(() => {
+    api.quotes.list().then(setQuotes);
+    api.customers.list().then(setCustomers);
+  }, []);
+
+  function createQuote() {
+    if (!customerId) return;
+    api.quotes.create({ customer_id: parseInt(customerId) }).then(q => {
+      setShowCreate(false);
+      navigate(`/quotes/${q.id}`);
+    });
+  }
+
+  return (
+    <>
+      <div className="page-header">
+        <h1>Quotes</h1>
+        <button className="btn btn-primary" onClick={() => setShowCreate(true)}>+ New Quote</button>
+      </div>
+
+      <div className="card">
+        <div className="table-wrap">
+          <table>
+            <thead>
+              <tr><th>ID</th><th>Customer</th><th>Date</th><th>Total</th><th>Discount</th><th>Grand Total</th><th>Deposit</th><th>Balance</th><th>Status</th></tr>
+            </thead>
+            <tbody>
+              {quotes.map(q => (
+                <tr key={q.id} style={{cursor:'pointer'}} onClick={() => navigate(`/quotes/${q.id}`)}>
+                  <td className="font-bold">#{q.id}</td>
+                  <td>{q.customer_name}</td>
+                  <td>{q.date_created}</td>
+                  <td>\u20A6{Number(q.total_amount).toLocaleString()}</td>
+                  <td>\u20A6{Number(q.discount).toLocaleString()}</td>
+                  <td>\u20A6{Number(q.grand_total).toLocaleString()}</td>
+                  <td>\u20A6{Number(q.deposit_paid).toLocaleString()}</td>
+                  <td>\u20A6{Number(q.balance_due).toLocaleString()}</td>
+                  <td><span className={`badge ${statusBadge[q.status] || 'badge-draft'}`}>{q.status}</span></td>
+                </tr>
+              ))}
+              {quotes.length === 0 && <tr><td colSpan={9} className="text-muted text-sm">No quotes yet</td></tr>}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {showCreate && (
+        <Modal title="New Quote" onClose={() => setShowCreate(false)}
+          footer={<><button className="btn btn-ghost" onClick={() => setShowCreate(false)}>Cancel</button><button className="btn btn-primary" onClick={createQuote}>Create</button></>}>
+          <div className="form-group">
+            <label>Customer *</label>
+            <select className="form-control" value={customerId} onChange={e => setCustomerId(e.target.value)}>
+              <option value="">Select customer...</option>
+              {customers.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+            </select>
+          </div>
+        </Modal>
+      )}
+    </>
+  );
+}
+
+================================================
+FILE: client/src/pages/QuoteDetail.jsx
+================================================
+import { useState, useEffect } from 'react';
+import { useParams, useNavigate } from 'react-router-dom';
+import { api } from '../api';
+import Modal from '../components/Modal';
+
+const productTypes = ['Base Print', 'Stretch Canvas', 'Floating Frame', 'Glass Frame', 'Hardwood Floor'];
+const statusList = ['Draft', 'Sent', 'Deposit Paid', 'Send to Production'];
+
+export default function QuoteDetail() {
+  const { id } = useParams();
+  const navigate = useNavigate();
+  const [quote, setQuote] = useState(null);
+  const [items, setItems] = useState([]);
+  const [receipts, setReceipts] = useState([]);
+  const [showItemModal, setShowItemModal] = useState(false);
+  const [editItem, setEditItem] = useState(null);
+  const [showReceiptModal, setShowReceiptModal] = useState(false);
+  const [showStatusModal, setShowStatusModal] = useState(false);
+  const [showDiscountModal, setShowDiscountModal] = useState(false);
+  const [newStatus, setNewStatus] = useState('');
+  const [discount, setDiscount] = useState(0);
+
+  const [form, setForm] = useState({
+    product_type: 'Stretch Canvas', quantity: 1, measurement_unit: 'cm',
+    width: '', height: '', square_meters: ''
+  });
+
+  const [receiptForm, setReceiptForm] = useState({
+    payment_date: new Date().toISOString().split('T')[0],
+    amount_paid: '', payment_method: 'Cash'
+  });
+
+  useEffect(() => {
+    api.quotes.get(id).then(q => {
+      setQuote(q);
+      setItems(q.items || []);
+      setReceipts(q.receipts || []);
+      setDiscount(q.discount || 0);
+    });
+  }, [id]);
+
+  function load() {
+    api.quotes.get(id).then(q => {
+      setQuote(q);
+      setItems(q.items || []);
+      setReceipts(q.receipts || []);
+    });
+  }
+
+  function openAddItem() {
+    setEditItem(null);
+    setForm({ product_type: 'Stretch Canvas', quantity: 1, measurement_unit: 'cm', width: '', height: '', square_meters: '' });
+    setShowItemModal(true);
+  }
+
+  function openEditItem(item) {
+    setEditItem(item);
+    setForm({
+      product_type: item.product_type, quantity: item.quantity, measurement_unit: item.measurement_unit,
+      width: item.width || '', height: item.height || '', square_meters: item.square_meters || ''
+    });
+    setShowItemModal(true);
+  }
+
+  function saveItem() {
+    const data = {
+      quote_id: parseInt(id),
+      product_type: form.product_type,
+      quantity: parseInt(form.quantity) || 1,
+      measurement_unit: form.measurement_unit,
+      width: parseFloat(form.width) || 0,
+      height: parseFloat(form.height) || 0,
+      square_meters: parseFloat(form.square_meters) || 0
+    };
+    const p = editItem ? api.quoteItems.update(editItem.id, data) : api.quoteItems.create(data);
+    p.then(() => { setShowItemModal(false); load(); });
+  }
+
+  function deleteItem(itemId) {
+    if (confirm('Delete this line item?')) api.quoteItems.delete(itemId).then(load);
+  }
+
+  function saveReceipt() {
+    api.receipts.create({
+      quote_id: parseInt(id),
+      payment_date: receiptForm.payment_date,
+      amount_paid: parseFloat(receiptForm.amount_paid),
+      payment_method: receiptForm.payment_method
+    }).then(() => { setShowReceiptModal(false); load(); });
+  }
+
+  function deleteReceipt(rId) {
+    if (confirm('Delete this receipt?')) api.receipts.delete(rId).then(load);
+  }
+
+  function updateStatus() {
+    api.quotes.updateStatus(id, newStatus).then(() => { setShowStatusModal(false); load(); });
+  }
+
+  function saveDiscount() {
+    api.quotes.update(id, { discount: parseFloat(discount) || 0 }).then(() => { setShowDiscountModal(false); load(); });
+  }
+
+  if (!quote) return <div>Loading...</div>;
+
+  const isFloor = form.product_type === 'Hardwood Floor';
+
+  return (
+    <>
+      <div className="page-header">
+        <div>
+          <h1>Quote #{quote.id}</h1>
+          <div className="text-muted text-sm" style={{marginTop:2}}>
+            {quote.customer_name} &middot; {quote.date_created} &middot;
+            <span className={`badge badge-${quote.status === 'Draft' ? 'draft' : quote.status === 'Sent' ? 'sent' : quote.status === 'Deposit Paid' ? 'deposit' : 'production'}`} style={{marginLeft:6}}>{quote.status}</span>
+          </div>
+        </div>
+        <div className="flex gap-2">
+          <button className="btn" onClick={() => setShowDiscountModal(true)}>Set Discount</button>
+          <button className="btn" onClick={() => setShowStatusModal(true)}>Change Status</button>
+          <button className="btn" onClick={() => setShowReceiptModal(true)}>+ Receipt</button>
+          <button className="btn btn-primary" onClick={openAddItem}>+ Add Item</button>
+          <button className="btn btn-ghost" onClick={() => navigate('/quotes')}>Back</button>
+        </div>
+      </div>
+
+      <div className="kpi-grid">
+        <div className="kpi-card"><div className="kpi-label">Total Amount</div><div className="kpi-value">\u20A6{Number(quote.total_amount).toLocaleString()}</div></div>
+        <div className="kpi-card"><div className="kpi-label">Discount</div><div className="kpi-value amber">-\u20A6{Number(quote.discount).toLocaleString()}</div></div>
+        <div className="kpi-card"><div className="kpi-label">Grand Total</div><div className="kpi-value blue">\u20A6{Number(quote.grand_total).toLocaleString()}</div></div>
+        <div className="kpi-card"><div className="kpi-label">Deposit Paid</div><div className="kpi-value green">\u20A6{Number(quote.deposit_paid).toLocaleString()}</div></div>
+        <div className="kpi-card"><div className="kpi-label">Balance Due</div><div className="kpi-value red">\u20A6{Number(quote.balance_due).toLocaleString()}</div></div>
+      </div>
+
+      <div className="card">
+        <h3 style={{fontSize:14,marginBottom:12}}>Line Items (Jobs)</h3>
+        <div className="table-wrap">
+          <table>
+            <thead>
+              <tr><th>ID</th><th>Product</th><th>Qty</th><th>WxH</th><th>Unit</th><th>Sq.M</th><th>Tier</th><th>Price</th><th>Status</th><th></th></tr>
+            </thead>
+            <tbody>
+              {items.map(i => (
+                <tr key={i.id}>
+                  <td className="font-bold">JOB-{i.id}</td>
+                  <td>{i.product_type}</td>
+                  <td>{i.quantity}</td>
+                  <td>{i.width && i.height ? `${i.width}\u00D7${i.height}` : '-'}</td>
+                  <td>{i.measurement_unit}</td>
+                  <td>{i.square_meters || '-'}</td>
+                  <td>{i.size_tier}</td>
+                  <td>\u20A6{Number(i.calculated_price).toLocaleString()}</td>
+                  <td><span className={`badge badge-${i.production_status === 'Complete' ? 'complete' : i.production_status === 'In Production' ? 'progress' : 'pending'}`}>{i.production_status}</span></td>
+                  <td>
+                    <button className="btn btn-ghost btn-sm" onClick={() => openEditItem(i)}>Edit</button>
+                    <button className="btn btn-ghost btn-sm" onClick={() => deleteItem(i.id)}>Del</button>
+                  </td>
+                </tr>
+              ))}
+              {items.length === 0 && <tr><td colSpan={10} className="text-muted text-sm">No items yet</td></tr>}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div className="card">
+        <h3 style={{fontSize:14,marginBottom:12}}>Receipts</h3>
+        <div className="table-wrap">
+          <table>
+            <thead><tr><th>ID</th><th>Date</th><th>Amount</th><th>Method</th><th></th></tr></thead>
+            <tbody>
+              {receipts.map(r => (
+                <tr key={r.id}>
+                  <td>#{r.id}</td>
+                  <td>{r.payment_date}</td>
+                  <td>\u20A6{Number(r.amount_paid).toLocaleString()}</td>
+                  <td>{r.payment_method}</td>
+                  <td><button className="btn btn-ghost btn-sm" onClick={() => deleteReceipt(r.id)}>Del</button></td>
+                </tr>
+              ))}
+              {receipts.length === 0 && <tr><td colSpan={5} className="text-muted text-sm">No receipts</td></tr>}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {showItemModal && (
+        <Modal title={editItem ? 'Edit Line Item' : 'Add Line Item'} onClose={() => setShowItemModal(false)}
+          footer={<><button className="btn btn-ghost" onClick={() => setShowItemModal(false)}>Cancel</button><button className="btn btn-primary" onClick={saveItem}>{editItem ? 'Update' : 'Add'}</button></>}>
+          <div className="form-group">
+            <label>Product Type *</label>
+            <select className="form-control" value={form.product_type} onChange={e => setForm({...form, product_type: e.target.value})}>
+              {productTypes.map(p => <option key={p} value={p}>{p}</option>)}
+            </select>
+          </div>
+          {!isFloor && (
+            <>
+              <div className="form-group">
+                <label>Measurement Unit</label>
+                <select className="form-control" value={form.measurement_unit} onChange={e => setForm({...form, measurement_unit: e.target.value})}>
+                  <option value="cm">cm</option><option value="inches">inches</option>
+                </select>
+              </div>
+              <div className="form-row">
+                <div className="form-group">
+                  <label>Width ({form.measurement_unit})</label>
+                  <input className="form-control" type="number" min="0" step="0.1" value={form.width} onChange={e => setForm({...form, width: e.target.value})} />
+                </div>
+                <div className="form-group">
+                  <label>Height ({form.measurement_unit})</label>
+                  <input className="form-control" type="number" min="0" step="0.1" value={form.height} onChange={e => setForm({...form, height: e.target.value})} />
+                </div>
+              </div>
+            </>
+          )}
+          {isFloor && (
+            <div className="form-group">
+              <label>Square Meters *</label>
+              <input className="form-control" type="number" min="0" step="0.01" value={form.square_meters} onChange={e => setForm({...form, square_meters: e.target.value})} />
+            </div>
+          )}
+          <div className="form-group">
+            <label>Quantity</label>
+            <input className="form-control" type="number" min="1" value={form.quantity} onChange={e => setForm({...form, quantity: e.target.value})} />
+          </div>
+        </Modal>
+      )}
+
+      {showReceiptModal && (
+        <Modal title="Add Receipt" onClose={() => setShowReceiptModal(false)}
+          footer={<><button className="btn btn-ghost" onClick={() => setShowReceiptModal(false)}>Cancel</button><button className="btn btn-primary" onClick={saveReceipt}>Save</button></>}>
+          <div className="form-group">
+            <label>Payment Date</label>
+            <input className="form-control" type="date" value={receiptForm.payment_date} onChange={e => setReceiptForm({...receiptForm, payment_date: e.target.value})} />
+          </div>
+          <div className="form-group">
+            <label>Amount Paid (NGN)</label>
+            <input className="form-control" type="number" min="0" value={receiptForm.amount_paid} onChange={e => setReceiptForm({...receiptForm, amount_paid: e.target.value})} />
+          </div>
+          <div className="form-group">
+            <label>Payment Method</label>
+            <select className="form-control" value={receiptForm.payment_method} onChange={e => setReceiptForm({...receiptForm, payment_method: e.target.value})}>
+              <option value="Cash">Cash</option><option value="Transfer">Transfer</option><option value="POS">POS</option>
+            </select>
+          </div>
+        </Modal>
+      )}
+
+      {showStatusModal && (
+        <Modal title="Change Status" onClose={() => setShowStatusModal(false)}
+          footer={<><button className="btn btn-ghost" onClick={() => setShowStatusModal(false)}>Cancel</button><button className="btn btn-primary" onClick={updateStatus}>Update</button></>}>
+          <div className="form-group">
+            <label>New Status</label>
+            <select className="form-control" value={newStatus} onChange={e => setNewStatus(e.target.value)}>
+              <option value="">Select...</option>
+              {statusList.map(s => <option key={s} value={s}>{s}</option>)}
+            </select>
+          </div>
+          {newStatus === 'Send to Production' && (
+            <div className="text-sm" style={{color:'#d97706',marginTop:8}}>
+              This will push all items to the Production floor as individual Jobs.
+            </div>
+          )}
+        </Modal>
+      )}
+
+      {showDiscountModal && (
+        <Modal title="Set Discount" onClose={() => setShowDiscountModal(false)}
+          footer={<><button className="btn btn-ghost" onClick={() => setShowDiscountModal(false)}>Cancel</button><button className="btn btn-primary" onClick={saveDiscount}>Save</button></>}>
+          <div className="form-group">
+            <label>Discount Amount (NGN)</label>
+            <input className="form-control" type="number" min="0" value={discount} onChange={e => setDiscount(e.target.value)} />
+          </div>
+        </Modal>
+      )}
+    </>
+  );
+}
+
+================================================
+FILE: client/src/pages/Production.jsx
+================================================
+import { useState, useEffect } from 'react';
+import { api } from '../api';
+import Modal from '../components/Modal';
+
+const stages = ['Wood Cut', 'Wood Join', 'Stretch', 'Frame Cut', 'Frame Join', 'Glass Cut', 'Assembly'];
+const artisans = ['Kunle', 'Tobi', 'Segun', 'Ade', 'Emma'];
+
+export default function Production() {
+  const [jobs, setJobs] = useState([]);
+  const [logs, setLogs] = useState([]);
+  const [showLogModal, setShowLogModal] = useState(false);
+  const [selectedJob, setSelectedJob] = useState(null);
+  const [filterProd, setFilterProd] = useState('');
+  const [form, setForm] = useState({ stage: stages[0], artisans: [artisans[0]], date: new Date().toISOString().split('T')[0] });
+
+  useEffect(() => { load(); }, []);
+
+  function load() {
+    api.productionLogs.productionJobs().then(setJobs);
+    api.productionLogs.list().then(setLogs);
+  }
+
+  function openQuickLog(job) {
+    setSelectedJob(job);
+    setForm({ stage: stages[0], artisans: [artisans[0]], date: new Date().toISOString().split('T')[0] });
+    setShowLogModal(true);
+  }
+
+  function saveLog() {
+    if (!selectedJob) return;
+    api.productionLogs.create({
+      job_id: selectedJob.id,
+      stage_completed: form.stage,
+      artisans: form.artisans,
+      date_completed: form.date
+    }).then(() => {
+      setShowLogModal(false);
+      load();
+    });
+  }
+
+  function getRequiredStages(pt) {
+    const map = {
+      'Stretch Canvas': ['Wood Cut', 'Wood Join', 'Stretch'],
+      'Floating Frame': ['Wood Cut', 'Wood Join', 'Stretch', 'Frame Cut', 'Frame Join', 'Assembly'],
+      'Glass Frame': ['Wood Cut', 'Wood Join', 'Stretch', 'Frame Cut', 'Frame Join', 'Glass Cut', 'Assembly']
+    };
+    return map[pt] || [];
+  }
+
+  function getLoggedStages(jobId) {
+    return logs.filter(l => l.job_id === jobId).map(l => l.stage_completed);
+  }
+
+  const filteredJobs = jobs.filter(j => !filterProd || j.production_status === filterProd);
+
+  return (
+    <>
+      <div className="page-header">
+        <h1>Production Ledger</h1>
+        <button className="btn" onClick={load}>&#x21bb; Refresh</button>
+      </div>
+
+      <div className="filter-bar">
+        <label>Filter:</label>
+        <select value={filterProd} onChange={e => setFilterProd(e.target.value)}>
+          <option value="">All Status</option>
+          <option value="Pending">Pending</option>
+          <option value="In Production">In Production</option>
+          <option value="Complete">Complete</option>
+        </select>
+      </div>
+
+      <div className="card">
+        <div className="table-wrap">
+          <table>
+            <thead>
+              <tr><th>Job ID</th><th>Quote</th><th>Customer</th><th>Product</th><th>Tier</th><th>Stages</th><th>Progress</th><th>Status</th><th></th></tr>
+            </thead>
+            <tbody>
+              {filteredJobs.map(j => {
+                const required = getRequiredStages(j.product_type);
+                const loggedStages = getLoggedStages(j.id);
+                return (
+                  <tr key={j.id}>
+                    <td className="font-bold">JOB-{j.id}</td>
+                    <td>#{j.quote_id}</td>
+                    <td>{j.customer_name}</td>
+                    <td>{j.product_type}</td>
+                    <td>{j.size_tier}</td>
+                    <td>{loggedStages.length}/{required.length}</td>
+                    <td>
+                      <div className="progress-bar">
+                        {required.map((s, i) => (
+                          <div key={s} className={`progress-dot ${loggedStages.includes(s) ? 'done' : ''}`} title={s} />
+                        ))}
+                      </div>
+                    </td>
+                    <td><span className={`badge badge-${j.production_status === 'Complete' ? 'complete' : j.production_status === 'In Production' ? 'progress' : 'pending'}`}>{j.production_status}</span></td>
+                    <td>
+                      {j.production_status !== 'Complete' && (
+                        <button className="btn btn-sm btn-primary" onClick={() => openQuickLog(j)}>Quick Log</button>
+                      )}
+                    </td>
+                  </tr>
+                );
+              })}
+              {filteredJobs.length === 0 && <tr><td colSpan={9} className="text-muted text-sm">No production jobs found</td></tr>}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {showLogModal && selectedJob && (
+        <Modal title={`Quick Log - JOB-${selectedJob.id} (${selectedJob.product_type})`} onClose={() => setShowLogModal(false)}
+          footer={<><button className="btn btn-ghost" onClick={() => setShowLogModal(false)}>Cancel</button><button className="btn btn-primary" onClick={saveLog}>Log Stage</button></>}>
+          <div className="form-group">
+            <label>Stage Completed</label>
+            <select className="form-control" value={form.stage} onChange={e => setForm({...form, stage: e.target.value})}>
+              {stages.map(s => <option key={s} value={s}>{s}</option>)}
+            </select>
+          </div>
+          <div className="form-group">
+            <label>Artisans (hold Ctrl to select multiple)</label>
+            <select className="form-control" multiple size={4} value={form.artisans}
+              onChange={e => setForm({...form, artisans: Array.from(e.target.selectedOptions, o => o.value)})}>
+              {artisans.map(a => <option key={a} value={a}>{a}</option>)}
+            </select>
+          </div>
+          <div className="form-group">
+            <label>Date Completed</label>
+            <input className="form-control" type="date" value={form.date} onChange={e => setForm({...form, date: e.target.value})} />
+          </div>
+          <div className="text-sm text-muted">
+            Commission: \u20A6{Number(selectedJob.size_tier === 'Large' ? 150 : selectedJob.size_tier === 'Small' ? 100 : 125).toLocaleString()} per artisan (split equally)
+          </div>
+        </Modal>
+      )}
+    </>
+  );
+}
+
+================================================
+FILE: client/src/pages/Payroll.jsx
+================================================
+import { useState, useEffect } from 'react';
+import { api } from '../api';
+
+function getWeekRange(date) {
+  const d = new Date(date);
+  const day = d.getDay();
+  const diff = d.getDate() - day + (day === 0 ? -6 : 1);
+  const mon = new Date(d.setDate(diff));
+  const sun = new Date(mon);
+  sun.setDate(mon.getDate() + 6);
+  return {
+    start: mon.toISOString().split('T')[0],
+    end: sun.toISOString().split('T')[0]
+  };
+}
+
+export default function Payroll() {
+  const today = new Date().toISOString().split('T')[0];
+  const [weekStart, setWeekStart] = useState(getWeekRange(today).start);
+  const [weekEnd, setWeekEnd] = useState(getWeekRange(today).end);
+  const [data, setData] = useState(null);
+  const [statusFilter, setStatusFilter] = useState('Unpaid');
+
+  useEffect(() => {
+    api.payroll.weekly({ start_date: weekStart, end_date: weekEnd, payment_status: statusFilter }).then(setData);
+  }, [weekStart, weekEnd, statusFilter]);
+
+  function prevWeek() {
+    const d = new Date(weekStart);
+    d.setDate(d.getDate() - 7);
+    const range = getWeekRange(d.toISOString());
+    setWeekStart(range.start); setWeekEnd(range.end);
+  }
+
+  function nextWeek() {
+    const d = new Date(weekStart);
+    d.setDate(d.getDate() + 7);
+    const range = getWeekRange(d.toISOString());
+    setWeekStart(range.start); setWeekEnd(range.end);
+  }
+
+  function markAsPaid(artisanName) {
+    if (!data || !data.logs) return;
+    const ids = data.logs
+      .filter(l => {
+        const arts = JSON.parse(l.artisans || '[]');
+        return arts.includes(artisanName) && l.payment_status === 'Unpaid';
+      })
+      .map(l => l.id);
+    if (ids.length === 0) return;
+    if (!confirm(`Mark ${ids.length} stage(s) as Paid for ${artisanName}?`)) return;
+    api.productionLogs.payAll(ids).then(() => {
+      api.payroll.weekly({ start_date: weekStart, end_date: weekEnd, payment_status: statusFilter }).then(setData);
+    });
+  }
+
+  return (
+    <>
+      <div className="page-header">
+        <h1>Weekly Payroll</h1>
+      </div>
+
+      <div className="filter-bar">
+        <button className="btn btn-sm" onClick={prevWeek}>&larr; Prev</button>
+        <strong>{weekStart} to {weekEnd}</strong>
+        <button className="btn btn-sm" onClick={nextWeek}>Next &rarr;</button>
+        <label>Status:</label>
+        <select value={statusFilter} onChange={e => setStatusFilter(e.target.value)}>
+          <option value="Unpaid">Unpaid</option>
+          <option value="Paid">Paid</option>
+          <option value="">All</option>
+        </select>
+      </div>
+
+      {data && (
+        <div className="mb-4 text-sm text-muted">
+          {data.logs.length} stage log(s) found for this period
+        </div>
+      )}
+
+      <div>
+        {data && Object.entries(data.by_artisan || {}).length === 0 && (
+          <div className="card text-muted text-sm">No payroll records found for this period.</div>
+        )}
+        {data && Object.entries(data.by_artisan || {}).map(([artisan, info]) => (
+          <div key={artisan} className="artisan-block">
+            <div className="artisan-header">
+              <div>
+                <div className="artisan-name">{artisan}</div>
+                <div className="artisan-summary">
+                  <span>Stages: <strong>{info.count}</strong></span>
+                  <span>Total Owed: <strong>\u20A6{Number(info.total).toLocaleString()}</strong></span>
+                </div>
+              </div>
+              {statusFilter === 'Unpaid' && (
+                <button className="btn btn-green btn-sm" onClick={() => markAsPaid(artisan)}>Mark Week as Paid</button>
+              )}
+            </div>
+            <div className="table-wrap">
+              <table>
+                <thead>
+                  <tr><th>Job ID</th><th>Customer</th><th>Stage</th><th>Product</th><th>Size Tier</th><th>Date</th><th>Split Commission</th><th>Paid</th></tr>
+                </thead>
+                <tbody>
+                  {info.stages.map(log => (
+                    <tr key={log.id}>
+                      <td className="font-bold">JOB-{log.job_id}</td>
+                      <td>{log.customer_name}</td>
+                      <td>{log.stage_completed}</td>
+                      <td>{log.product_type}</td>
+                      <td>{log.size_tier}</td>
+                      <td>{log.date_completed}</td>
+                      <td>\u20A6{Number(log.split_commission).toLocaleString()}</td>
+                      <td><span className={`badge badge-${log.payment_status === 'Paid' ? 'paid' : 'unpaid'}`}>{log.payment_status}</span></td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        ))}
+      </div>
+    </>
+  );
+}
+
+================================================
+FILE: client/src/pages/Receipts.jsx
+================================================
+import { useState, useEffect } from 'react';
+import { api } from '../api';
+
+export default function Receipts() {
+  const [quotes, setQuotes] = useState([]);
+  const [receipts, setReceipts] = useState([]);
+
+  useEffect(() => {
+    api.quotes.list().then(setQuotes);
+    api.productionLogs.list().then(() => {});
+    loadAllReceipts();
+  }, []);
+
+  async function loadAllReceipts() {
+    const qs = await api.quotes.list();
+    const all = [];
+    for (const q of qs) {
+      const rs = await api.receipts.byQuote(q.id);
+      all.push(...rs.map(r => ({ ...r, quote: q })));
+    }
+    setReceipts(all.sort((a, b) => b.id - a.id));
+  }
+
+  return (
+    <>
+      <div className="page-header">
+        <h1>Payment Receipts Ledger</h1>
+      </div>
+
+      <div className="card">
+        <div className="table-wrap">
+          <table>
+            <thead>
+              <tr><th>Receipt ID</th><th>Quote</th><th>Customer</th><th>Date</th><th>Amount</th><th>Method</th></tr>
+            </thead>
+            <tbody>
+              {receipts.map(r => (
+                <tr key={r.id}>
+                  <td className="font-bold">#{r.id}</td>
+                  <td>#{r.quote_id}</td>
+                  <td>{r.quote?.customer_name || '-'}</td>
+                  <td>{r.payment_date}</td>
+                  <td className="font-bold">\u20A6{Number(r.amount_paid).toLocaleString()}</td>
+                  <td><span className={`badge ${r.payment_method === 'Transfer' ? 'badge-sent' : r.payment_method === 'POS' ? 'badge-deposit' : 'badge-draft'}`}>{r.payment_method}</span></td>
+                </tr>
+              ))}
+              {receipts.length === 0 && <tr><td colSpan={6} className="text-muted text-sm">No receipts recorded yet</td></tr>}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </>
+  );
+}
+
+================================================
+FILE: client/src/pages/Reports.jsx
+================================================
+import { useState, useEffect } from 'react';
+import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, LineChart, Line, Legend } from 'recharts';
+import { api } from '../api';
+
+const COLORS = ['#2563eb', '#16a34a', '#d97706', '#dc2626', '#8b5cf6'];
+
+export default function Reports() {
+  const now = new Date();
+  const [month, setMonth] = useState(now.getMonth() + 1);
+  const [year, setYear] = useState(now.getFullYear());
+  const [sales, setSales] = useState(null);
+  const [prod, setProd] = useState(null);
+  const [arts, setArts] = useState(null);
+
+  useEffect(() => {
+    api.reports.sales(month, year).then(setSales);
+    api.reports.production(month, year).then(setProd);
+    api.reports.artisans(month, year).then(setArts);
+  }, [month, year]);
+
+  return (
+    <>
+      <div className="page-header">
+        <h1>Monthly Reports</h1>
+        <div className="flex gap-2">
+          <select className="form-control" style={{width:'auto'}} value={month} onChange={e => setMonth(parseInt(e.target.value))}>
+            {[1,2,3,4,5,6,7,8,9,10,11,12].map(m => <option key={m} value={m}>{new Date(2020,m-1,1).toLocaleString('en',{month:'long'})}</option>)}
+          </select>
+          <select className="form-control" style={{width:'auto'}} value={year} onChange={e => setYear(parseInt(e.target.value))}>
+            {[2024,2025,2026,2027,2028].map(y => <option key={y} value={y}>{y}</option>)}
+          </select>
+        </div>
+      </div>
+
+      <div className="kpi-grid">
+        {sales && <>
+          <div className="kpi-card"><div className="kpi-label">Quotes Sent</div><div className="kpi-value">{sales.quotes_sent}</div></div>
+          <div className="kpi-card"><div className="kpi-label">Quotes Approved</div><div className="kpi-value">{sales.quotes_approved}</div></div>
+          <div className="kpi-card"><div className="kpi-label">Revenue Collected</div><div className="kpi-value green">\u20A6{Number(sales.revenue_collected).toLocaleString()}</div></div>
+        </>}
+        {prod && <>
+          <div className="kpi-card"><div className="kpi-label">Frames Produced</div><div className="kpi-value">{prod.total_frames}</div></div>
+          <div className="kpi-card"><div className="kpi-label">Floor Sq.M Sold</div><div className="kpi-value amber">{Number(prod.total_floor_sqm).toFixed(1)}</div></div>
+        </>}
+        {arts && <>
+          <div className="kpi-card"><div className="kpi-label">Payroll Paid Out</div><div className="kpi-value red">\u20A6{Number(arts.total_payroll).toLocaleString()}</div></div>
+        </>}
+      </div>
+
+      <div style={{display:'grid', gridTemplateColumns:'1fr 1fr', gap:16}}>
+        {sales && (
+          <div className="card">
+            <h3 style={{fontSize:14,marginBottom:12}}>Daily Revenue</h3>
+            <ResponsiveContainer width="100%" height={250}>
+              <LineChart data={sales.daily_revenue}>
+                <CartesianGrid strokeDasharray="3 3" />
+                <XAxis dataKey="payment_date" tick={{fontSize:11}} />
+                <YAxis tick={{fontSize:11}} />
+                <Tooltip />
+                <Line type="monotone" dataKey="total" stroke="#2563eb" strokeWidth={2} name="Revenue" />
+              </LineChart>
+            </ResponsiveContainer>
+          </div>
+        )}
+
+        {prod && (
+          <div className="card">
+            <h3 style={{fontSize:14,marginBottom:12}}>Frames by Product Type</h3>
+            <ResponsiveContainer width="100%" height={250}>
+              <BarChart data={prod.by_product_type}>
+                <CartesianGrid strokeDasharray="3 3" />
+                <XAxis dataKey="product_type" tick={{fontSize:11}} />
+                <YAxis tick={{fontSize:11}} />
+                <Tooltip />
+                <Bar dataKey="count" fill="#16a34a" name="Count" />
+              </BarChart>
+            </ResponsiveContainer>
+          </div>
+        )}
+      </div>
+
+      {arts && arts.leaderboard.length > 0 && (
+        <div className="card mt-4">
+          <h3 style={{fontSize:14,marginBottom:12}}>Artisan Performance Leaderboard</h3>
+          <div className="table-wrap">
+            <table>
+              <thead><tr><th>#</th><th>Artisan</th><th>Stages Completed</th><th>Total Earned (NGN)</th></tr></thead>
+              <tbody>
+                {arts.leaderboard.map((a, i) => (
+                  <tr key={a.artisan}>
+                    <td>{i + 1}</td>
+                    <td className="font-bold">{a.artisan}</td>
+                    <td>{a.stages_completed}</td>
+                    <td className="font-bold">\u20A6{Number(a.total_earned).toLocaleString()}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+    </>
+  );
+}
+
+================================================
+FILE: client/src/pages/Settings.jsx
+================================================
+import { useState, useEffect } from 'react';
+import { api } from '../api';
+
+export default function Settings() {
+  const [settings, setSettings] = useState(null);
+  const [saving, setSaving] = useState(false);
+  const [msg, setMsg] = useState('');
+
+  useEffect(() => { api.settings.get().then(setSettings); }, []);
+
+  function update(key, value) {
+    setSaving(true);
+    api.settings.update(key, value).then(() => {
+      setMsg('Saved!');
+      setTimeout(() => setMsg(''), 2000);
+      setSaving(false);
+    });
+  }
+
+  if (!settings) return <div>Loading...</div>;
+
+  return (
+    <>
+      <div className="page-header">
+        <h1>System Settings</h1>
+        {msg && <span style={{color:'#16a34a',fontSize:13}}>{msg}</span>}
+      </div>
+
+      <div className="card">
+        <h3 style={{fontSize:14,marginBottom:16}}>Pricing Engine - Base Rates (per cm\u00B2)</h3>
+        <div className="form-row">
+          {Object.entries(settings.pricing_base_rates || {}).map(([tier, rate]) => (
+            <div key={tier} className="form-group">
+              <label>{tier}</label>
+              <input className="form-control" type="number" step="0.1" value={rate}
+                onChange={e => {
+                  const newRates = { ...settings.pricing_base_rates, [tier]: parseFloat(e.target.value) || 0 };
+                  update('pricing_base_rates', newRates);
+                }} />
+            </div>
+          ))}
+        </div>
+      </div>
+
+      <div className="card">
+        <h3 style={{fontSize:14,marginBottom:16}}>Framing Multipliers</h3>
+        <div className="form-row">
+          {Object.entries(settings.pricing_framing_multipliers || {}).map(([tier, mult]) => (
+            <div key={tier} className="form-group">
+              <label>{tier}</label>
+              <input className="form-control" type="number" step="0.1" value={mult}
+                onChange={e => {
+                  const newMults = { ...settings.pricing_framing_multipliers, [tier]: parseFloat(e.target.value) || 1 };
+                  update('pricing_framing_multipliers', newMults);
+                }} />
+            </div>
+          ))}
+        </div>
+      </div>
+
+      <div className="card">
+        <h3 style={{fontSize:14,marginBottom:16}}>Glass Multipliers</h3>
+        <div className="form-row">
+          {Object.entries(settings.pricing_glass_multipliers || {}).map(([tier, mult]) => (
+            <div key={tier} className="form-group">
+              <label>{tier}</label>
+              <input className="form-control" type="number" step="0.1" value={mult}
+                onChange={e => {
+                  const newMults = { ...settings.pricing_glass_multipliers, [tier]: parseFloat(e.target.value) || 1 };
+                  update('pricing_glass_multipliers', newMults);
+                }} />
+            </div>
+          ))}
+        </div>
+      </div>
+
+      <div className="card">
+        <h3 style={{fontSize:14,marginBottom:16}}>Hardwood Floor Rate (per sq.m)</h3>
+        <div className="form-group" style={{maxWidth:200}}>
+          <label>Rate (NGN)</label>
+          <input className="form-control" type="number" value={settings.pricing_floor_rate || 15000}
+            onChange={e => update('pricing_floor_rate', parseFloat(e.target.value) || 15000)} />
+        </div>
+      </div>
+
+      <div className="card">
+        <h3 style={{fontSize:14,marginBottom:16}}>Artisan Commission Matrix (NGN)</h3>
+        <div className="table-wrap">
+          <table>
+            <thead><tr><th>Stage</th><th>Small</th><th>Medium</th><th>Large</th></tr></thead>
+            <tbody>
+              {Object.entries(settings.commission_matrix || {}).map(([stage, rates]) => (
+                <tr key={stage}>
+                  <td className="font-bold">{stage}</td>
+                  {['Small', 'Medium', 'Large'].map(tier => (
+                    <td key={tier}>
+                      <input className="form-control" style={{width:80}} type="number" value={rates[tier]}
+                        onChange={e => {
+                          const newMatrix = { ...settings.commission_matrix };
+                          newMatrix[stage] = { ...newMatrix[stage], [tier]: parseFloat(e.target.value) || 0 };
+                          update('commission_matrix', newMatrix);
+                        }} />
+                    </td>
+                  ))}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div className="card">
+        <h3 style={{fontSize:14,marginBottom:16}}>Production Routing (Required Stages per Product)</h3>
+        <div className="table-wrap">
+          <table>
+            <thead><tr><th>Product Type</th><th>Required Stages</th></tr></thead>
+            <tbody>
+              {Object.entries(settings.production_routing || {}).map(([product, stages]) => (
+                <tr key={product}>
+                  <td className="font-bold">{product}</td>
+                  <td>{stages.length > 0 ? stages.join(' \u2192 ') : '(No stages / Not applicable)'}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </>
+  );
+}
